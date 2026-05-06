@@ -1,0 +1,8 @@
+# Path: backend/alembic/README
+
+Alembic migrations for MediCalend.
+
+Commands (local):
+- alembic revision --autogenerate -m "message"
+- alembic upgrade head
+- alembic downgrade -1

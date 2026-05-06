@@ -1,0 +1,39 @@
+# Path: backend/docker-compose.yml
+
+services:
+  db:
+    image: postgres:16
+    container_name: medicalend_postgres
+    environment:
+      POSTGRES_USER: medicalend
+      POSTGRES_PASSWORD: medicalend
+      POSTGRES_DB: medicalend
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: medicalend_api
+    env_file:
+      - .env
+    environment:
+      # ✅ docker networkben a hostnév: db
+      DATABASE_URL: postgresql+psycopg2://medicalend:medicalend@db:5432/medicalend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+    # ✅ DEV: a projekt mappa bemountolása a konténerbe
+    volumes:
+      - .:/app
+
+    # ✅ DEV: hot reload (ha nem kell, visszaállíthatod a Dockerfile CMD-jére)
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+volumes:
+  pgdata:

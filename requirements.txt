@@ -1,0 +1,20 @@
+# Path: backend/requirements.txt
+
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+pydantic-settings
+python-dotenv
+PyYAML
+email-validator
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt
+psycopg2-binary
+alembic
+python-multipart
+stripe
+google-auth
+google-auth-oauthlib
+google-api-python-client

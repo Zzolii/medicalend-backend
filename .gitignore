@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+.env
+uploads/
+*.pyc
+.idea/
+medicalend.db
