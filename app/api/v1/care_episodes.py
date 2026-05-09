@@ -1,3 +1,5 @@
+# Path: backend/app/api/v1/care_episodes.py
+
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -30,6 +32,30 @@ def _normalize_clinic_role(value: Optional[str]) -> Optional[str]:
     return value
 
 
+def _raise_platform_admin_medical_access_denied() -> None:
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Administratorul platformei nu poate accesa direct date medicale, "
+            "journey-uri sau timeline-uri ale pacienților."
+        ),
+    )
+
+
+def _raise_not_enough_permissions() -> None:
+    raise HTTPException(
+        status_code=403,
+        detail="Nu ai permisiunea necesară pentru această secțiune.",
+    )
+
+
+def _raise_access_denied() -> None:
+    raise HTTPException(
+        status_code=403,
+        detail="Nu ai acces la acest episod medical.",
+    )
+
+
 def _get_my_patient_profile(db: Session, current_user):
     patient = (
         db.query(models.Patient)
@@ -39,7 +65,7 @@ def _get_my_patient_profile(db: Session, current_user):
     if not patient:
         raise HTTPException(
             status_code=404,
-            detail="Patient profile not linked to this user",
+            detail="Profilul de pacient nu este asociat acestui cont.",
         )
     return patient
 
@@ -47,6 +73,9 @@ def _get_my_patient_profile(db: Session, current_user):
 def _try_get_my_provider_profile(
     db: Session, current_user
 ) -> Optional[models.Provider]:
+    if current_user.role == "admin":
+        return None
+
     provider = (
         db.query(models.Provider)
         .filter(models.Provider.user_id == current_user.id)
@@ -55,11 +84,11 @@ def _try_get_my_provider_profile(
     if not provider:
         return None
 
-    if (
-        current_user.role != "admin"
-        and getattr(provider, "status", None) != "approved"
-    ):
-        raise HTTPException(status_code=403, detail="Provider profile not approved")
+    if getattr(provider, "status", None) != "approved":
+        raise HTTPException(
+            status_code=403,
+            detail="Profilul de furnizor nu este aprobat.",
+        )
 
     return provider
 
@@ -71,7 +100,7 @@ def _get_episode_or_404(db: Session, episode_id: int) -> models.CareEpisode:
         .first()
     )
     if not ep:
-        raise HTTPException(status_code=404, detail="Care episode not found")
+        raise HTTPException(status_code=404, detail="Episodul medical nu a fost găsit.")
     return ep
 
 
@@ -88,10 +117,14 @@ def _build_staff_scope(db: Session, current_user) -> Dict[str, Any]:
     clinic_ids: Set[int] = set()
     clinic_wide_clinic_ids: Set[int] = set()
     doctor_ids: Set[int] = set()
+    clinic_roles: Set[str] = set()
 
     for membership in memberships:
         role = _normalize_clinic_role(getattr(membership, "role", None))
         clinic_id = getattr(membership, "clinic_id", None)
+
+        if role:
+            clinic_roles.add(role)
 
         if role not in STAFF_VIEW_ROLES or clinic_id is None:
             continue
@@ -109,6 +142,7 @@ def _build_staff_scope(db: Session, current_user) -> Dict[str, Any]:
         "clinic_ids": list(clinic_ids),
         "clinic_wide_clinic_ids": list(clinic_wide_clinic_ids),
         "doctor_ids": list(doctor_ids),
+        "clinic_roles": list(clinic_roles),
     }
 
 
@@ -299,12 +333,12 @@ def _clinic_staff_can_access_episode(
 
 def _ensure_episode_access(db: Session, episode: models.CareEpisode, current_user):
     if current_user.role == "admin":
-        return
+        _raise_platform_admin_medical_access_denied()
 
     if current_user.role == "patient":
         patient = _get_my_patient_profile(db, current_user)
         if episode.patient_id != patient.id:
-            raise HTTPException(status_code=403, detail="Not allowed")
+            _raise_access_denied()
         return
 
     staff_scope = _build_staff_scope(db, current_user)
@@ -320,17 +354,21 @@ def _ensure_episode_access(db: Session, episode: models.CareEpisode, current_use
     if provider and _provider_can_access_episode(db, episode, provider.id):
         return
 
-    raise HTTPException(status_code=403, detail="Not enough permissions")
+    _raise_not_enough_permissions()
 
 
 def _ensure_episode_write_access(
     db: Session, episode: models.CareEpisode, current_user
 ):
+    if current_user.role == "admin":
+        _raise_platform_admin_medical_access_denied()
+
     if current_user.role == "patient":
         raise HTTPException(
             status_code=403,
-            detail="Patients cannot modify care episodes",
+            detail="Pacienții nu pot modifica episoade medicale.",
         )
+
     _ensure_episode_access(db, episode, current_user)
 
 
@@ -340,8 +378,11 @@ def create_episode(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    if current_user.role not in ("provider", "admin"):
-        raise HTTPException(status_code=403, detail="Not enough permissions")
+    if current_user.role == "admin":
+        _raise_platform_admin_medical_access_denied()
+
+    if current_user.role != "provider":
+        _raise_not_enough_permissions()
 
     patient = (
         db.query(models.Patient)
@@ -349,32 +390,18 @@ def create_episode(
         .first()
     )
     if not patient:
-        raise HTTPException(status_code=400, detail="Patient does not exist")
+        raise HTTPException(status_code=400, detail="Pacientul nu există.")
 
     provider = _try_get_my_provider_profile(db, current_user)
-    if not provider and current_user.role != "admin":
+    if not provider:
         raise HTTPException(
             status_code=403,
-            detail="Provider profile not linked to this user",
+            detail="Profilul de furnizor nu este asociat acestui cont.",
         )
-
-    if current_user.role == "admin":
-        owner_provider_id = (
-            payload.owner_provider_id
-            if hasattr(payload, "owner_provider_id")
-            else None
-        )
-        if not owner_provider_id:
-            raise HTTPException(
-                status_code=400,
-                detail="owner_provider_id is required for admin-created episodes",
-            )
-    else:
-        owner_provider_id = provider.id
 
     episode = models.CareEpisode(
         patient_id=payload.patient_id,
-        owner_provider_id=owner_provider_id,
+        owner_provider_id=provider.id,
         title=payload.title,
         status="open",
     )
@@ -390,11 +417,7 @@ def list_episodes(
     current_user=Depends(get_current_user),
 ):
     if current_user.role == "admin":
-        return (
-            db.query(models.CareEpisode)
-            .order_by(models.CareEpisode.id.desc())
-            .all()
-        )
+        _raise_platform_admin_medical_access_denied()
 
     if current_user.role == "patient":
         patient = _get_my_patient_profile(db, current_user)
@@ -467,7 +490,7 @@ def list_episodes(
         )
 
     if not filters:
-        raise HTTPException(status_code=403, detail="Not enough permissions")
+        _raise_not_enough_permissions()
 
     return (
         db.query(models.CareEpisode)
@@ -507,7 +530,7 @@ def update_episode(
             .first()
         )
         if not patient:
-            raise HTTPException(status_code=400, detail="Patient does not exist")
+            raise HTTPException(status_code=400, detail="Pacientul nu există.")
 
     for k, v in data.items():
         setattr(episode, k, v)
@@ -580,11 +603,21 @@ def get_timeline(
 
     staff_scope = _build_staff_scope(db, current_user)
     doctor_ids = staff_scope["doctor_ids"]
+    clinic_roles = set(staff_scope["clinic_roles"])
 
     if doctor_ids and not staff_scope["clinic_wide_clinic_ids"]:
         appointments = [
             a for a in appointments if getattr(a, "doctor_id", None) in doctor_ids
         ]
+
+    if current_user.role == "patient":
+        notes = []
+        tasks = []
+
+    if "reception" in clinic_roles:
+        notes = []
+        tasks = []
+        documents = []
 
     return jsonable_encoder(
         {
@@ -612,6 +645,15 @@ def add_note(
     episode = _get_episode_or_404(db, episode_id)
     _ensure_episode_write_access(db, episode, current_user)
 
+    staff_scope = _build_staff_scope(db, current_user)
+    clinic_roles = set(staff_scope["clinic_roles"])
+
+    if "reception" in clinic_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Recepția nu poate adăuga note medicale în timeline.",
+        )
+
     note = models.CareNote(
         episode_id=episode.id,
         author_user_id=current_user.id,
@@ -631,6 +673,15 @@ def list_notes(
 ):
     episode = _get_episode_or_404(db, episode_id)
     _ensure_episode_access(db, episode, current_user)
+
+    if current_user.role == "patient":
+        return []
+
+    staff_scope = _build_staff_scope(db, current_user)
+    clinic_roles = set(staff_scope["clinic_roles"])
+
+    if "reception" in clinic_roles:
+        return []
 
     return (
         db.query(models.CareNote)
@@ -654,6 +705,15 @@ def add_task(
     episode = _get_episode_or_404(db, episode_id)
     _ensure_episode_write_access(db, episode, current_user)
 
+    staff_scope = _build_staff_scope(db, current_user)
+    clinic_roles = set(staff_scope["clinic_roles"])
+
+    if "reception" in clinic_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Recepția nu poate adăuga taskuri medicale în timeline.",
+        )
+
     task = models.CareTask(
         episode_id=episode.id,
         title=payload.title,
@@ -676,6 +736,15 @@ def list_tasks(
     episode = _get_episode_or_404(db, episode_id)
     _ensure_episode_access(db, episode, current_user)
 
+    if current_user.role == "patient":
+        return []
+
+    staff_scope = _build_staff_scope(db, current_user)
+    clinic_roles = set(staff_scope["clinic_roles"])
+
+    if "reception" in clinic_roles:
+        return []
+
     return (
         db.query(models.CareTask)
         .filter(models.CareTask.episode_id == episode.id)
@@ -693,10 +762,19 @@ def update_task(
 ):
     task = db.query(models.CareTask).filter(models.CareTask.id == task_id).first()
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail="Taskul nu a fost găsit.")
 
     episode = _get_episode_or_404(db, task.episode_id)
     _ensure_episode_write_access(db, episode, current_user)
+
+    staff_scope = _build_staff_scope(db, current_user)
+    clinic_roles = set(staff_scope["clinic_roles"])
+
+    if "reception" in clinic_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Recepția nu poate modifica taskuri medicale.",
+        )
 
     data = payload.model_dump(exclude_unset=True)
     for k, v in data.items():
