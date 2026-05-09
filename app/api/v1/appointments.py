@@ -34,9 +34,12 @@ INACTIVE_EPISODE_STATUSES = ("completed", "closed", "archived")
 BLOCKING_APPOINTMENT_STATUSES = ("scheduled", "in_progress")
 PROVIDER_VISIBLE_APPOINTMENT_STATUSES = ("scheduled", "in_progress", "completed")
 
-STAFF_BOOKING_ROLES = {"clinic_admin", "doctor", "assistant", "reception", "receptionist"}
-STAFF_VIEW_ROLES = {"clinic_admin", "doctor", "assistant", "reception", "receptionist"}
-CLINIC_WIDE_VIEW_ROLES = {"clinic_admin", "assistant", "reception", "receptionist"}
+CLINIC_WIDE_VIEW_ROLES = {"clinic_admin", "reception", "receptionist"}
+CLINIC_WIDE_BOOKING_ROLES = {"clinic_admin", "reception", "receptionist"}
+DOCTOR_ROLE = "doctor"
+ASSISTANT_ROLE = "assistant"
+STAFF_VIEW_ROLES = CLINIC_WIDE_VIEW_ROLES | {DOCTOR_ROLE, ASSISTANT_ROLE}
+STAFF_BOOKING_ROLES = CLINIC_WIDE_BOOKING_ROLES | {DOCTOR_ROLE, ASSISTANT_ROLE}
 
 
 def _normalize_clinic_role(value: Optional[str]) -> Optional[str]:
@@ -45,17 +48,27 @@ def _normalize_clinic_role(value: Optional[str]) -> Optional[str]:
     return value
 
 
+def _raise_platform_admin_appointment_access_denied() -> None:
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Această zonă conține date medicale și operaționale ale pacienților. "
+            "Administratorul platformei poate vedea doar informații minime prin panoul de administrare."
+        ),
+    )
+
+
 def _get_my_patient_profile(db: Session, current_user) -> PatientModel:
     patient = db.query(PatientModel).filter(PatientModel.user_id == current_user.id).first()
     if not patient:
-        raise HTTPException(status_code=404, detail="Patient profile not linked to this user")
+        raise HTTPException(status_code=404, detail="Profilul de pacient nu este asociat acestui cont.")
     return patient
 
 
 def _get_my_provider_profile(db: Session, current_user) -> ProviderModel:
     provider = get_current_provider_for_user(db, current_user)
     if getattr(provider, "status", None) != "approved" and current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Provider profile not approved")
+        raise HTTPException(status_code=403, detail="Profilul de furnizor nu este aprobat.")
     return provider
 
 
@@ -70,16 +83,40 @@ def _get_active_staff_memberships(db: Session, current_user) -> List[ClinicMembe
     )
 
 
-def _get_accessible_clinic_ids(db: Session, current_user) -> List[int]:
+def _get_staff_scope(db: Session, current_user) -> dict:
     memberships = _get_active_staff_memberships(db, current_user)
-    clinic_ids = []
+
+    clinic_ids: List[int] = []
+    doctor_ids: List[int] = []
+    assistant_clinic_ids: List[int] = []
+    has_clinic_wide_access = False
 
     for membership in memberships:
         role = _normalize_clinic_role(getattr(membership, "role", None))
-        if role in STAFF_VIEW_ROLES and membership.clinic_id not in clinic_ids:
-            clinic_ids.append(membership.clinic_id)
+        clinic_id = getattr(membership, "clinic_id", None)
+        provider_doctor_id = getattr(membership, "provider_doctor_id", None)
 
-    return clinic_ids
+        if role not in STAFF_VIEW_ROLES or clinic_id is None:
+            continue
+
+        if clinic_id not in clinic_ids:
+            clinic_ids.append(clinic_id)
+
+        if role in CLINIC_WIDE_VIEW_ROLES:
+            has_clinic_wide_access = True
+
+        if role == DOCTOR_ROLE and provider_doctor_id is not None and provider_doctor_id not in doctor_ids:
+            doctor_ids.append(provider_doctor_id)
+
+        if role == ASSISTANT_ROLE and clinic_id not in assistant_clinic_ids:
+            assistant_clinic_ids.append(clinic_id)
+
+    return {
+        "clinic_ids": clinic_ids,
+        "doctor_ids": doctor_ids,
+        "assistant_clinic_ids": assistant_clinic_ids,
+        "has_clinic_wide_access": has_clinic_wide_access,
+    }
 
 
 def _has_staff_booking_access(db: Session, current_user) -> bool:
@@ -93,40 +130,14 @@ def _has_staff_booking_access(db: Session, current_user) -> bool:
     return False
 
 
-def _get_staff_scope(db: Session, current_user) -> dict:
-    memberships = _get_active_staff_memberships(db, current_user)
-
-    clinic_ids: List[int] = []
-    doctor_ids: List[int] = []
-    has_clinic_wide_access = False
-
-    for membership in memberships:
-        role = _normalize_clinic_role(getattr(membership, "role", None))
-        clinic_id = getattr(membership, "clinic_id", None)
-        provider_doctor_id = getattr(membership, "provider_doctor_id", None)
-
-        if role not in STAFF_VIEW_ROLES:
-            continue
-
-        if clinic_id is not None and clinic_id not in clinic_ids:
-            clinic_ids.append(clinic_id)
-
-        if role in CLINIC_WIDE_VIEW_ROLES:
-            has_clinic_wide_access = True
-
-        if role == "doctor" and provider_doctor_id is not None and provider_doctor_id not in doctor_ids:
-            doctor_ids.append(provider_doctor_id)
-
-    return {
-        "clinic_ids": clinic_ids,
-        "doctor_ids": doctor_ids,
-        "has_clinic_wide_access": has_clinic_wide_access,
-    }
+def _get_accessible_clinic_ids(db: Session, current_user) -> List[int]:
+    scope = _get_staff_scope(db, current_user)
+    return scope["clinic_ids"]
 
 
 def _ensure_provider_clinic_access(db: Session, provider: ProviderModel, current_user) -> None:
     if current_user.role == "admin":
-        return
+        _raise_platform_admin_appointment_access_denied()
 
     provider_clinic_id = getattr(provider, "clinic_id", None)
     if provider_clinic_id is None:
@@ -145,36 +156,43 @@ def _ensure_doctor_assignment_allowed(
     doctor_id: Optional[int],
 ) -> None:
     if current_user.role == "admin":
-        return
+        _raise_platform_admin_appointment_access_denied()
 
     scope = _get_staff_scope(db, current_user)
+
     if scope["has_clinic_wide_access"]:
         return
 
     allowed_doctor_ids = scope["doctor_ids"]
-    if not allowed_doctor_ids:
+
+    if allowed_doctor_ids:
+        if doctor_id is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Doctor staff can only manage appointments assigned to their own doctor profile",
+            )
+
+        if doctor_id not in allowed_doctor_ids:
+            raise HTTPException(status_code=403, detail="You can only manage your own appointments")
+
+        doctor = (
+            db.query(ProviderDoctorModel)
+            .filter(
+                ProviderDoctorModel.id == doctor_id,
+                ProviderDoctorModel.provider_id == provider_id,
+                ProviderDoctorModel.is_active == True,  # noqa: E712
+            )
+            .first()
+        )
+        if not doctor:
+            raise HTTPException(status_code=400, detail="Doctor does not belong to this provider")
         return
 
-    if doctor_id is None:
+    if scope["assistant_clinic_ids"]:
         raise HTTPException(
             status_code=403,
-            detail="Doctor staff can only manage appointments assigned to their own doctor profile",
+            detail="Assistant users can only work on already assigned workflow items.",
         )
-
-    if doctor_id not in allowed_doctor_ids:
-        raise HTTPException(status_code=403, detail="You can only manage your own appointments")
-
-    doctor = (
-        db.query(ProviderDoctorModel)
-        .filter(
-            ProviderDoctorModel.id == doctor_id,
-            ProviderDoctorModel.provider_id == provider_id,
-            ProviderDoctorModel.is_active == True,  # noqa: E712
-        )
-        .first()
-    )
-    if not doctor:
-        raise HTTPException(status_code=400, detail="Doctor does not belong to this provider")
 
 
 def _has_referral_access(db: Session, episode_id: int, to_provider_id: int) -> bool:
@@ -192,7 +210,7 @@ def _has_referral_access(db: Session, episode_id: int, to_provider_id: int) -> b
 
 def _ensure_episode_access_for_provider(db: Session, episode_id: int, current_user) -> None:
     if current_user.role == "admin":
-        return
+        _raise_platform_admin_appointment_access_denied()
 
     provider = _get_my_provider_profile(db, current_user)
     episode = db.query(CareEpisodeModel).filter(CareEpisodeModel.id == episode_id).first()
@@ -422,9 +440,26 @@ def _appointment_belongs_to_staff_clinic(db: Session, appointment: AppointmentMo
     return appointment_doctor_id in allowed_doctor_ids
 
 
+def _appointment_is_in_staff_clinic(db: Session, appointment: AppointmentModel, current_user) -> bool:
+    scope = _get_staff_scope(db, current_user)
+    clinic_ids = scope["clinic_ids"]
+
+    if not clinic_ids:
+        return False
+
+    appointment_clinic_id = getattr(appointment, "clinic_id", None)
+
+    provider_clinic_id = None
+    if appointment.provider_id is not None:
+        provider = db.query(ProviderModel).filter(ProviderModel.id == appointment.provider_id).first()
+        provider_clinic_id = getattr(provider, "clinic_id", None) if provider else None
+
+    return appointment_clinic_id in clinic_ids or provider_clinic_id in clinic_ids
+
+
 def _ensure_appointment_access(db: Session, appointment: AppointmentModel, current_user) -> None:
     if current_user.role == "admin":
-        return
+        _raise_platform_admin_appointment_access_denied()
 
     if current_user.role == "patient":
         patient = _get_my_patient_profile(db, current_user)
@@ -432,8 +467,17 @@ def _ensure_appointment_access(db: Session, appointment: AppointmentModel, curre
             raise HTTPException(status_code=403, detail="Not allowed")
         return
 
-    if _appointment_belongs_to_staff_clinic(db, appointment, current_user):
-        return
+    scope = _get_staff_scope(db, current_user)
+
+    if scope["clinic_ids"]:
+        if _appointment_belongs_to_staff_clinic(db, appointment, current_user):
+            return
+
+        if _appointment_is_in_staff_clinic(db, appointment, current_user):
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have enough access for this appointment.",
+            )
 
     try:
         provider = _get_my_provider_profile(db, current_user)
@@ -757,8 +801,7 @@ def list_appointments(
     current_user=Depends(get_current_user),
 ):
     if current_user.role == "admin":
-        rows = db.query(AppointmentModel).order_by(AppointmentModel.start_time.desc()).offset(skip).limit(limit).all()
-        return _serialize_appointments(db, rows)
+        _raise_platform_admin_appointment_access_denied()
 
     if current_user.role == "patient":
         patient = _get_my_patient_profile(db, current_user)
@@ -814,9 +857,9 @@ def search_appointments(
     current_user=Depends(get_current_user),
 ):
     if current_user.role == "admin":
-        query = db.query(AppointmentModel)
+        _raise_platform_admin_appointment_access_denied()
 
-    elif current_user.role == "patient":
+    if current_user.role == "patient":
         my_patient = _get_my_patient_profile(db, current_user)
         query = db.query(AppointmentModel).filter(AppointmentModel.patient_id == my_patient.id)
         patient_id = None
@@ -832,7 +875,8 @@ def search_appointments(
                 doctor_ids=scope["doctor_ids"],
                 clinic_wide=scope["has_clinic_wide_access"],
             )
-            if not scope["has_clinic_wide_access"] and scope["doctor_ids"]:
+
+            if not scope["has_clinic_wide_access"]:
                 doctor_id = None
         else:
             my_provider = _get_my_provider_profile(db, current_user)
@@ -885,6 +929,9 @@ def create_appointment(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
+    if current_user.role == "admin":
+        _raise_platform_admin_appointment_access_denied()
+
     if current_user.role == "patient":
         my_patient = _get_my_patient_profile(db, current_user)
 
@@ -919,6 +966,8 @@ def create_appointment(
             ep = db.query(CareEpisodeModel).filter(CareEpisodeModel.id == data["episode_id"]).first()
             if not ep:
                 raise HTTPException(status_code=400, detail="Care episode does not exist")
+            if ep.patient_id != my_patient.id:
+                raise HTTPException(status_code=403, detail="You can only use your own care episodes")
         else:
             ep = _get_or_create_episode_for_pair(
                 db,
@@ -950,7 +999,7 @@ def create_appointment(
         )
         return _serialize_appointment(db, appointment)
 
-    if current_user.role != "admin" and not _has_staff_booking_access(db, current_user):
+    if not _has_staff_booking_access(db, current_user):
         try:
             _get_my_provider_profile(db, current_user)
         except HTTPException:
@@ -970,28 +1019,27 @@ def create_appointment(
     if payload.doctor_id is not None:
         doctor = db.query(ProviderDoctorModel).filter(ProviderDoctorModel.id == payload.doctor_id).first()
 
-    if current_user.role != "admin":
-        scope = _get_staff_scope(db, current_user)
-        clinic_ids = scope["clinic_ids"]
+    scope = _get_staff_scope(db, current_user)
+    clinic_ids = scope["clinic_ids"]
 
-        if clinic_ids:
-            _ensure_provider_clinic_access(db, provider, current_user)
-            _ensure_doctor_assignment_allowed(
-                db,
-                current_user=current_user,
-                provider_id=payload.provider_id,
-                doctor_id=payload.doctor_id,
+    if clinic_ids:
+        _ensure_provider_clinic_access(db, provider, current_user)
+        _ensure_doctor_assignment_allowed(
+            db,
+            current_user=current_user,
+            provider_id=payload.provider_id,
+            doctor_id=payload.doctor_id,
+        )
+    else:
+        my_provider = _get_my_provider_profile(db, current_user)
+        if payload.provider_id != my_provider.id:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only create appointments for your own provider profile",
             )
-        else:
-            my_provider = _get_my_provider_profile(db, current_user)
-            if payload.provider_id != my_provider.id:
-                raise HTTPException(
-                    status_code=403,
-                    detail="You can only create appointments for your own provider profile",
-                )
 
-        if payload.episode_id is not None:
-            _ensure_episode_access_for_provider(db, payload.episode_id, current_user)
+    if payload.episode_id is not None:
+        _ensure_episode_access_for_provider(db, payload.episode_id, current_user)
 
     if payload.episode_id is not None:
         ep = db.query(CareEpisodeModel).filter(CareEpisodeModel.id == payload.episode_id).first()
@@ -1063,6 +1111,9 @@ def add_appointment_task(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
+    if current_user.role in ("admin", "patient"):
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
     appointment = _get_appointment_or_404(db, appointment_id)
     _ensure_appointment_access(db, appointment, current_user)
 
@@ -1097,28 +1148,53 @@ def update_appointment(
 
     update_data = payload.model_dump(exclude_unset=True)
 
+    if current_user.role == "patient":
+        allowed_patient_fields = {"status"}
+        forbidden_fields = set(update_data.keys()) - allowed_patient_fields
+        if forbidden_fields:
+            raise HTTPException(
+                status_code=403,
+                detail="Patients can only cancel their own appointments from this endpoint.",
+            )
+
+        if update_data.get("status") != "canceled":
+            raise HTTPException(
+                status_code=403,
+                detail="Patients can only change appointment status to canceled.",
+            )
+
+        if appointment.status in {"completed", "canceled"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Appointment is final ({appointment.status}) and cannot be changed",
+            )
+
+        appointment.status = "canceled"
+        db.commit()
+        db.refresh(appointment)
+        return _serialize_appointment(db, appointment)
+
     final_statuses = {"completed", "canceled"}
-    if current_user.role != "admin" and current_user.role != "patient":
-        if appointment.status in final_statuses and "status" in update_data:
-            incoming = str(update_data["status"])
-            if incoming != appointment.status:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Appointment is final ({appointment.status}) and cannot be changed",
-                )
+    if appointment.status in final_statuses and "status" in update_data:
+        incoming = str(update_data["status"])
+        if incoming != appointment.status:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Appointment is final ({appointment.status}) and cannot be changed",
+            )
 
-        allowed_transitions = {
-            "scheduled": {"in_progress", "completed", "canceled"},
-            "in_progress": {"completed", "canceled"},
-            "completed": set(),
-            "canceled": set(),
-        }
+    allowed_transitions = {
+        "scheduled": {"in_progress", "completed", "canceled"},
+        "in_progress": {"completed", "canceled"},
+        "completed": set(),
+        "canceled": set(),
+    }
 
-        if "status" in update_data:
-            curr = str(appointment.status or "scheduled")
-            nxt = str(update_data["status"])
-            if nxt != curr and nxt not in allowed_transitions.get(curr, set()):
-                raise HTTPException(status_code=409, detail=f"Invalid status transition: {curr} -> {nxt}")
+    if "status" in update_data:
+        curr = str(appointment.status or "scheduled")
+        nxt = str(update_data["status"])
+        if nxt != curr and nxt not in allowed_transitions.get(curr, set()):
+            raise HTTPException(status_code=409, detail=f"Invalid status transition: {curr} -> {nxt}")
 
     if "start_time" in update_data:
         update_data["start_time"] = _naive_dt(update_data.get("start_time"))
@@ -1136,30 +1212,24 @@ def update_appointment(
 
     _validate_doctor_belongs_to_provider(db, new_provider_id, new_doctor_id)
 
-    if current_user.role != "admin" and current_user.role != "patient":
-        scope = _get_staff_scope(db, current_user)
-        clinic_ids = scope["clinic_ids"]
+    scope = _get_staff_scope(db, current_user)
+    clinic_ids = scope["clinic_ids"]
 
-        if clinic_ids:
-            _ensure_provider_clinic_access(db, provider, current_user)
-            _ensure_doctor_assignment_allowed(
-                db,
-                current_user=current_user,
-                provider_id=new_provider_id,
-                doctor_id=new_doctor_id,
-            )
-        else:
-            my_provider = _get_my_provider_profile(db, current_user)
-            if new_provider_id != my_provider.id:
-                raise HTTPException(status_code=403, detail="Providers cannot change provider_id")
+    if clinic_ids:
+        _ensure_provider_clinic_access(db, provider, current_user)
+        _ensure_doctor_assignment_allowed(
+            db,
+            current_user=current_user,
+            provider_id=new_provider_id,
+            doctor_id=new_doctor_id,
+        )
+    else:
+        my_provider = _get_my_provider_profile(db, current_user)
+        if new_provider_id != my_provider.id:
+            raise HTTPException(status_code=403, detail="Providers cannot change provider_id")
 
     if "episode_id" in update_data and update_data["episode_id"] is not None:
-        if current_user.role == "patient":
-            ep = db.query(CareEpisodeModel).filter(CareEpisodeModel.id == update_data["episode_id"]).first()
-            if not ep:
-                raise HTTPException(status_code=400, detail="Care episode does not exist")
-        else:
-            _ensure_episode_access_for_provider(db, update_data["episode_id"], current_user)
+        _ensure_episode_access_for_provider(db, update_data["episode_id"], current_user)
 
     if "provider_id" in update_data:
         update_data["clinic_id"] = getattr(provider, "clinic_id", None)
@@ -1197,6 +1267,9 @@ def delete_appointment(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
+    if current_user.role in ("admin", "patient"):
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
     appointment = db.query(AppointmentModel).filter(AppointmentModel.id == appointment_id).first()
     if not appointment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
