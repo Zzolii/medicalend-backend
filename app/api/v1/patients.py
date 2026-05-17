@@ -51,10 +51,79 @@ class PatientDashboardOut(BaseModel):
     active_episodes: List[PatientDashboardEpisode] = []
 
 
+class PatientJourneyAppointmentOut(BaseModel):
+    id: int
+    provider_id: Optional[int] = None
+    provider_name: Optional[str] = None
+    doctor_id: Optional[int] = None
+    start_time: datetime
+    end_time: Optional[datetime] = None
+    status: str
+    notes: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PatientJourneyReferralOut(BaseModel):
+    id: int
+    from_provider_id: int
+    from_provider_name: Optional[str] = None
+    to_provider_id: int
+    to_provider_name: Optional[str] = None
+    reason: str
+    status: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PatientJourneyEpisodeOut(BaseModel):
+    id: int
+    title: str
+    status: str
+    owner_provider_id: int
+    owner_provider_name: Optional[str] = None
+    created_at: datetime
+    appointments: List[PatientJourneyAppointmentOut] = []
+    referrals: List[PatientJourneyReferralOut] = []
+
+
+class PatientJourneyOut(BaseModel):
+    patient_id: int
+    episodes: List[PatientJourneyEpisodeOut] = []
+
+
 def _normalize_clinic_role(value: Optional[str]) -> Optional[str]:
     if value == "receptionist":
         return "reception"
     return value
+
+
+def _raise_platform_admin_patient_access_denied() -> None:
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Această zonă conține date medicale ale pacienților. "
+            "Administratorul platformei poate vedea doar informații operaționale "
+            "minime prin panoul de administrare."
+        ),
+    )
+
+
+def _raise_access_denied() -> None:
+    raise HTTPException(
+        status_code=403,
+        detail="Nu ai acces la datele acestui pacient.",
+    )
+
+
+def _raise_not_enough_permissions() -> None:
+    raise HTTPException(
+        status_code=403,
+        detail="Nu ai permisiunea necesară pentru această secțiune.",
+    )
 
 
 def _get_my_patient_profile(db: Session, current_user):
@@ -66,12 +135,15 @@ def _get_my_patient_profile(db: Session, current_user):
     if not patient:
         raise HTTPException(
             status_code=404,
-            detail="Patient profile not linked to this user",
+            detail="Profilul de pacient nu este asociat acestui cont.",
         )
     return patient
 
 
 def _try_get_my_provider_profile(db: Session, current_user) -> Optional[models.Provider]:
+    if current_user.role == "admin":
+        return None
+
     provider = (
         db.query(models.Provider)
         .filter(models.Provider.user_id == current_user.id)
@@ -80,8 +152,11 @@ def _try_get_my_provider_profile(db: Session, current_user) -> Optional[models.P
     if not provider:
         return None
 
-    if current_user.role != "admin" and getattr(provider, "status", None) != "approved":
-        raise HTTPException(status_code=403, detail="Provider profile not approved")
+    if getattr(provider, "status", None) != "approved":
+        raise HTTPException(
+            status_code=403,
+            detail="Profilul de furnizor nu este aprobat.",
+        )
 
     return provider
 
@@ -211,7 +286,7 @@ def _patient_ids_from_doctor_scope_subquery(db: Session, doctor_ids: List[int]):
 
 def _build_patient_scope_filter(db: Session, current_user):
     if current_user.role == "admin":
-        return None
+        _raise_platform_admin_patient_access_denied()
 
     if current_user.role == "patient":
         patient = _get_my_patient_profile(db, current_user)
@@ -241,19 +316,19 @@ def _build_patient_scope_filter(db: Session, current_user):
         filters.append(models.Patient.id.in_(select(doctor_patient_ids.c.patient_id)))
 
     if not filters:
-        raise HTTPException(status_code=403, detail="Not enough permissions")
+        _raise_not_enough_permissions()
 
     return or_(*filters)
 
 
 def _ensure_patient_access(db: Session, patient: models.Patient, current_user):
     if current_user.role == "admin":
-        return
+        _raise_platform_admin_patient_access_denied()
 
     if current_user.role == "patient":
         own = _get_my_patient_profile(db, current_user)
         if own.id != patient.id:
-            raise HTTPException(status_code=403, detail="Not allowed")
+            _raise_access_denied()
         return
 
     scope_filter = _build_patient_scope_filter(db, current_user)
@@ -265,7 +340,7 @@ def _ensure_patient_access(db: Session, patient: models.Patient, current_user):
     )
 
     if not allowed:
-        raise HTTPException(status_code=403, detail="Not allowed")
+        _raise_access_denied()
 
 
 def _delete_patient_account_graph(db: Session, patient: models.Patient) -> None:
@@ -304,10 +379,10 @@ def _delete_patient_account_graph(db: Session, patient: models.Patient) -> None:
             models.Referral.episode_id.in_(episode_ids)
         ).delete(synchronize_session=False)
 
-    if hasattr(models, "MedicalDocument"):
-        db.query(models.MedicalDocument).filter(
-            models.MedicalDocument.patient_id == patient_id
-        ).delete(synchronize_session=False)
+        if hasattr(models, "MedicalDocument"):
+            db.query(models.MedicalDocument).filter(
+                models.MedicalDocument.episode_id.in_(episode_ids)
+            ).delete(synchronize_session=False)
 
     db.query(models.Appointment).filter(
         models.Appointment.patient_id == patient_id
@@ -343,7 +418,7 @@ def _delete_patient_account_graph(db: Session, patient: models.Patient) -> None:
     "/",
     response_model=Patient,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_roles("admin", "provider"))],
+    dependencies=[Depends(require_roles("provider"))],
 )
 def create_patient(payload: PatientCreate, db: Session = Depends(get_db)):
     if payload.fhir_id:
@@ -355,7 +430,7 @@ def create_patient(payload: PatientCreate, db: Session = Depends(get_db)):
         if existing:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Patient with this fhir_id already exists",
+                detail="Există deja un pacient cu acest fhir_id.",
             )
 
     patient = models.Patient(**payload.model_dump())
@@ -375,8 +450,7 @@ def list_patients(
     query = db.query(models.Patient)
 
     scope_filter = _build_patient_scope_filter(db, current_user)
-    if scope_filter is not None:
-        query = query.filter(scope_filter)
+    query = query.filter(scope_filter)
 
     return query.offset(skip).limit(limit).all()
 
@@ -386,20 +460,10 @@ def get_my_patient(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    if current_user.role not in ("patient", "admin"):
-        raise HTTPException(status_code=403, detail="Not enough permissions")
+    if current_user.role != "patient":
+        _raise_not_enough_permissions()
 
-    patient = (
-        db.query(models.Patient)
-        .filter(models.Patient.user_id == current_user.id)
-        .first()
-    )
-    if not patient:
-        raise HTTPException(
-            status_code=404,
-            detail="Patient profile not linked to this user",
-        )
-
+    patient = _get_my_patient_profile(db, current_user)
     return patient
 
 
@@ -412,7 +476,7 @@ def update_my_patient(
     if current_user.role != "patient":
         raise HTTPException(
             status_code=403,
-            detail="Only patient accounts can update themselves here",
+            detail="Doar conturile de pacient își pot actualiza profilul aici.",
         )
 
     patient = _get_my_patient_profile(db, current_user)
@@ -439,7 +503,7 @@ def delete_my_patient_account(
     if current_user.role != "patient":
         raise HTTPException(
             status_code=403,
-            detail="Only patient accounts can delete themselves here",
+            detail="Doar conturile de pacient își pot șterge profilul aici.",
         )
 
     patient = _get_my_patient_profile(db, current_user)
@@ -451,7 +515,7 @@ def delete_my_patient_account(
     return {
         "ok": True,
         "patient_id": patient_id,
-        "message": "Patient account deleted permanently.",
+        "message": "Contul de pacient a fost șters definitiv.",
     }
 
 
@@ -460,19 +524,10 @@ def get_my_patient_dashboard(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    if current_user.role not in ("patient", "admin"):
-        raise HTTPException(status_code=403, detail="Not enough permissions")
+    if current_user.role != "patient":
+        _raise_not_enough_permissions()
 
-    patient = (
-        db.query(models.Patient)
-        .filter(models.Patient.user_id == current_user.id)
-        .first()
-    )
-    if not patient:
-        raise HTTPException(
-            status_code=404,
-            detail="Patient profile not linked to this user",
-        )
+    patient = _get_my_patient_profile(db, current_user)
 
     now = datetime.now()
 
@@ -491,7 +546,11 @@ def get_my_patient_dashboard(
     if next_appt:
         prov_name: Optional[str] = None
         if next_appt.provider_id:
-            prov = db.query(ProviderModel).filter(ProviderModel.id == next_appt.provider_id).first()
+            prov = (
+                db.query(ProviderModel)
+                .filter(ProviderModel.id == next_appt.provider_id)
+                .first()
+            )
             if prov:
                 prov_name = getattr(prov, "name", None)
 
@@ -536,8 +595,7 @@ def search_patients(
     query = db.query(models.Patient)
 
     scope_filter = _build_patient_scope_filter(db, current_user)
-    if scope_filter is not None:
-        query = query.filter(scope_filter)
+    query = query.filter(scope_filter)
 
     if fhir_id:
         query = query.filter(models.Patient.fhir_id == fhir_id)
@@ -565,6 +623,147 @@ def search_patients(
     return query.all()
 
 
+@router.get("/{patient_id}/journey", response_model=PatientJourneyOut)
+def get_patient_journey(
+    patient_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    patient = db.query(models.Patient).filter(models.Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pacientul nu a fost găsit.",
+        )
+
+    _ensure_patient_access(db, patient, current_user)
+
+    episodes = (
+        db.query(CareEpisodeModel)
+        .filter(CareEpisodeModel.patient_id == patient.id)
+        .order_by(CareEpisodeModel.created_at.desc(), CareEpisodeModel.id.desc())
+        .all()
+    )
+
+    provider_ids: Set[int] = set()
+    episode_ids: List[int] = []
+
+    for episode in episodes:
+        provider_ids.add(episode.owner_provider_id)
+        episode_ids.append(episode.id)
+
+    appointments_by_episode: Dict[int, List[AppointmentModel]] = {}
+    referrals_by_episode: Dict[int, List[models.Referral]] = {}
+
+    if episode_ids:
+        appointments = (
+            db.query(AppointmentModel)
+            .filter(AppointmentModel.episode_id.in_(episode_ids))
+            .order_by(AppointmentModel.start_time.desc(), AppointmentModel.id.desc())
+            .all()
+        )
+
+        for appointment in appointments:
+            if appointment.provider_id:
+                provider_ids.add(appointment.provider_id)
+
+            if appointment.episode_id is not None:
+                appointments_by_episode.setdefault(
+                    appointment.episode_id,
+                    [],
+                ).append(appointment)
+
+        referrals = (
+            db.query(models.Referral)
+            .filter(models.Referral.episode_id.in_(episode_ids))
+            .order_by(models.Referral.created_at.desc(), models.Referral.id.desc())
+            .all()
+        )
+
+        for referral in referrals:
+            provider_ids.add(referral.from_provider_id)
+            provider_ids.add(referral.to_provider_id)
+            referrals_by_episode.setdefault(referral.episode_id, []).append(referral)
+
+    providers_by_id: Dict[int, ProviderModel] = {}
+    if provider_ids:
+        providers = (
+            db.query(ProviderModel)
+            .filter(ProviderModel.id.in_(list(provider_ids)))
+            .all()
+        )
+        providers_by_id = {provider.id: provider for provider in providers}
+
+    out_episodes: List[PatientJourneyEpisodeOut] = []
+
+    for episode in episodes:
+        owner_provider = providers_by_id.get(episode.owner_provider_id)
+
+        episode_appointments: List[PatientJourneyAppointmentOut] = []
+        for appointment in appointments_by_episode.get(episode.id, []):
+            provider = (
+                providers_by_id.get(appointment.provider_id)
+                if appointment.provider_id
+                else None
+            )
+
+            episode_appointments.append(
+                PatientJourneyAppointmentOut(
+                    id=appointment.id,
+                    provider_id=appointment.provider_id,
+                    provider_name=getattr(provider, "name", None) if provider else None,
+                    doctor_id=getattr(appointment, "doctor_id", None),
+                    start_time=appointment.start_time,
+                    end_time=appointment.end_time,
+                    status=appointment.status,
+                    notes=appointment.notes,
+                )
+            )
+
+        episode_referrals: List[PatientJourneyReferralOut] = []
+        for referral in referrals_by_episode.get(episode.id, []):
+            from_provider = providers_by_id.get(referral.from_provider_id)
+            to_provider = providers_by_id.get(referral.to_provider_id)
+
+            episode_referrals.append(
+                PatientJourneyReferralOut(
+                    id=referral.id,
+                    from_provider_id=referral.from_provider_id,
+                    from_provider_name=(
+                        getattr(from_provider, "name", None)
+                        if from_provider
+                        else None
+                    ),
+                    to_provider_id=referral.to_provider_id,
+                    to_provider_name=(
+                        getattr(to_provider, "name", None)
+                        if to_provider
+                        else None
+                    ),
+                    reason=referral.reason,
+                    status=referral.status,
+                    created_at=referral.created_at,
+                )
+            )
+
+        out_episodes.append(
+            PatientJourneyEpisodeOut(
+                id=episode.id,
+                title=episode.title,
+                status=episode.status,
+                owner_provider_id=episode.owner_provider_id,
+                owner_provider_name=(
+                    getattr(owner_provider, "name", None) if owner_provider else None
+                ),
+                created_at=episode.created_at,
+                appointments=episode_appointments,
+                referrals=episode_referrals,
+            )
+        )
+
+    return PatientJourneyOut(patient_id=patient.id, episodes=out_episodes)
+
+
 @router.get("/{patient_id}", response_model=Patient)
 def get_patient(
     patient_id: int,
@@ -575,7 +774,7 @@ def get_patient(
     if not patient:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Patient not found",
+            detail="Pacientul nu a fost găsit.",
         )
 
     _ensure_patient_access(db, patient, current_user)
@@ -585,7 +784,7 @@ def get_patient(
 @router.put(
     "/{patient_id}",
     response_model=Patient,
-    dependencies=[Depends(require_roles("admin", "provider"))],
+    dependencies=[Depends(require_roles("provider"))],
 )
 def update_patient(
     patient_id: int,
@@ -597,7 +796,7 @@ def update_patient(
     if not patient:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Patient not found",
+            detail="Pacientul nu a fost găsit.",
         )
 
     _ensure_patient_access(db, patient, current_user)
@@ -616,7 +815,7 @@ def update_patient(
         if existing:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Another patient already uses this fhir_id",
+                detail="Alt pacient folosește deja acest fhir_id.",
             )
 
     for key, value in data.items():
@@ -630,7 +829,7 @@ def update_patient(
 @router.delete(
     "/{patient_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require_roles("admin", "provider"))],
+    dependencies=[Depends(require_roles("provider"))],
 )
 def delete_patient(
     patient_id: int,
@@ -639,7 +838,7 @@ def delete_patient(
 ):
     patient = db.query(models.Patient).filter(models.Patient.id == patient_id).first()
     if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
+        raise HTTPException(status_code=404, detail="Pacientul nu a fost găsit.")
 
     _ensure_patient_access(db, patient, current_user)
 
