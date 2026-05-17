@@ -8,29 +8,65 @@ from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
 from app.db import get_db
+from app.models.clinic_membership import ClinicMembership
 from app.models.provider import Provider
-from app.models.provider_doctor import ProviderDoctor
 from app.models.provider_availability import ProviderAvailability
 from app.models.provider_availability_exception import ProviderAvailabilityException
+from app.models.provider_doctor import ProviderDoctor
 from app.schemas.provider_availability import (
     ProviderAvailabilityCreate,
-    ProviderAvailabilityOut,
     ProviderAvailabilityExceptionCreate,
-    ProviderAvailabilityExceptionOut,
     ProviderAvailabilityExceptionDeleteOut,
+    ProviderAvailabilityExceptionOut,
+    ProviderAvailabilityOut,
 )
 
 router = APIRouter(prefix="/providers/me/availability", tags=["provider-availability"])
 
 
-def _get_my_provider(db: Session, current_user):
-    provider = db.query(Provider).filter(Provider.user_id == current_user.id).first()
-    if not provider:
-        raise HTTPException(status_code=404, detail="Provider profile not found")
-    return provider
+def _get_my_active_membership(db: Session, current_user) -> Optional[ClinicMembership]:
+    return (
+        db.query(ClinicMembership)
+        .filter(
+            ClinicMembership.user_id == current_user.id,
+            ClinicMembership.is_active.is_(True),
+        )
+        .order_by(ClinicMembership.id.desc())
+        .first()
+    )
 
 
-def _validate_my_doctor(db: Session, provider_id: int, doctor_id: Optional[int]):
+def _get_my_provider(db: Session, current_user) -> Provider:
+    provider = (
+        db.query(Provider)
+        .filter(Provider.user_id == current_user.id)
+        .first()
+    )
+    if provider:
+        return provider
+
+    membership = _get_my_active_membership(db, current_user)
+    if membership:
+        provider = (
+            db.query(Provider)
+            .filter(
+                Provider.clinic_id == membership.clinic_id,
+                Provider.is_active.is_(True),
+            )
+            .order_by(Provider.id.desc())
+            .first()
+        )
+        if provider:
+            return provider
+
+    raise HTTPException(status_code=404, detail="Provider profile not found")
+
+
+def _validate_my_doctor(
+    db: Session,
+    provider_id: int,
+    doctor_id: Optional[int],
+) -> Optional[ProviderDoctor]:
     if doctor_id is None:
         return None
 
@@ -39,12 +75,38 @@ def _validate_my_doctor(db: Session, provider_id: int, doctor_id: Optional[int])
         .filter(
             ProviderDoctor.id == doctor_id,
             ProviderDoctor.provider_id == provider_id,
+            ProviderDoctor.is_active.is_(True),
         )
         .first()
     )
     if not doctor:
         raise HTTPException(status_code=404, detail="Doctor not found for this provider")
+
     return doctor
+
+
+def _resolve_doctor_scope(
+    db: Session,
+    provider_id: int,
+    requested_doctor_id: Optional[int],
+    current_user,
+) -> Optional[int]:
+    membership = _get_my_active_membership(db, current_user)
+
+    if membership and membership.provider_doctor_id is not None:
+        own_doctor_id = membership.provider_doctor_id
+
+        if requested_doctor_id is not None and requested_doctor_id != own_doctor_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Doctor users can manage only their own availability.",
+            )
+
+        _validate_my_doctor(db, provider_id, own_doctor_id)
+        return own_doctor_id
+
+    _validate_my_doctor(db, provider_id, requested_doctor_id)
+    return requested_doctor_id
 
 
 @router.get("", response_model=List[ProviderAvailabilityOut])
@@ -54,16 +116,21 @@ def list_my_availability(
     current_user=Depends(get_current_user),
 ):
     provider = _get_my_provider(db, current_user)
-    _validate_my_doctor(db, provider.id, doctor_id)
+    effective_doctor_id = _resolve_doctor_scope(
+        db=db,
+        provider_id=provider.id,
+        requested_doctor_id=doctor_id,
+        current_user=current_user,
+    )
 
     query = db.query(ProviderAvailability).filter(
         ProviderAvailability.provider_id == provider.id
     )
 
-    if doctor_id is None:
+    if effective_doctor_id is None:
         query = query.filter(ProviderAvailability.doctor_id.is_(None))
     else:
-        query = query.filter(ProviderAvailability.doctor_id == doctor_id)
+        query = query.filter(ProviderAvailability.doctor_id == effective_doctor_id)
 
     return query.order_by(ProviderAvailability.weekday.asc()).all()
 
@@ -75,13 +142,18 @@ def create_or_update_my_availability(
     current_user=Depends(get_current_user),
 ):
     provider = _get_my_provider(db, current_user)
-    _validate_my_doctor(db, provider.id, payload.doctor_id)
+    effective_doctor_id = _resolve_doctor_scope(
+        db=db,
+        provider_id=provider.id,
+        requested_doctor_id=payload.doctor_id,
+        current_user=current_user,
+    )
 
     row = (
         db.query(ProviderAvailability)
         .filter(
             ProviderAvailability.provider_id == provider.id,
-            ProviderAvailability.doctor_id == payload.doctor_id,
+            ProviderAvailability.doctor_id == effective_doctor_id,
             ProviderAvailability.weekday == payload.weekday,
         )
         .first()
@@ -97,7 +169,7 @@ def create_or_update_my_availability(
 
     availability = ProviderAvailability(
         provider_id=provider.id,
-        doctor_id=payload.doctor_id,
+        doctor_id=effective_doctor_id,
         weekday=payload.weekday,
         start_time=payload.start_time,
         end_time=payload.end_time,
@@ -117,21 +189,30 @@ def delete_my_availability(
     current_user=Depends(get_current_user),
 ):
     provider = _get_my_provider(db, current_user)
+    membership = _get_my_active_membership(db, current_user)
 
-    row = (
-        db.query(ProviderAvailability)
-        .filter(
-            ProviderAvailability.id == availability_id,
-            ProviderAvailability.provider_id == provider.id,
-        )
-        .first()
+    query = db.query(ProviderAvailability).filter(
+        ProviderAvailability.id == availability_id,
+        ProviderAvailability.provider_id == provider.id,
     )
+
+    if membership and membership.provider_doctor_id is not None:
+        query = query.filter(
+            ProviderAvailability.doctor_id == membership.provider_doctor_id
+        )
+
+    row = query.first()
     if not row:
         raise HTTPException(status_code=404, detail="Availability not found")
 
     db.delete(row)
     db.commit()
-    return {"ok": True, "id": availability_id}
+
+    return {
+        "ok": True,
+        "id": availability_id,
+        "deleted_at": datetime.now(timezone.utc),
+    }
 
 
 @router.get("/exceptions", response_model=List[ProviderAvailabilityExceptionOut])
@@ -141,16 +222,23 @@ def list_exceptions(
     current_user=Depends(get_current_user),
 ):
     provider = _get_my_provider(db, current_user)
-    _validate_my_doctor(db, provider.id, doctor_id)
+    effective_doctor_id = _resolve_doctor_scope(
+        db=db,
+        provider_id=provider.id,
+        requested_doctor_id=doctor_id,
+        current_user=current_user,
+    )
 
     query = db.query(ProviderAvailabilityException).filter(
         ProviderAvailabilityException.provider_id == provider.id
     )
 
-    if doctor_id is None:
+    if effective_doctor_id is None:
         query = query.filter(ProviderAvailabilityException.doctor_id.is_(None))
     else:
-        query = query.filter(ProviderAvailabilityException.doctor_id == doctor_id)
+        query = query.filter(
+            ProviderAvailabilityException.doctor_id == effective_doctor_id
+        )
 
     return query.order_by(ProviderAvailabilityException.date.asc()).all()
 
@@ -162,16 +250,12 @@ def create_or_update_exception(
     current_user=Depends(get_current_user),
 ):
     provider = _get_my_provider(db, current_user)
-    _validate_my_doctor(db, provider.id, payload.doctor_id)
-
-    print("=== EXCEPTION PAYLOAD START ===")
-    print("doctor_id:", payload.doctor_id)
-    print("date:", payload.date)
-    print("is_closed:", payload.is_closed)
-    print("start_time:", payload.start_time)
-    print("end_time:", payload.end_time)
-    print("note:", payload.note)
-    print("=== EXCEPTION PAYLOAD END ===")
+    effective_doctor_id = _resolve_doctor_scope(
+        db=db,
+        provider_id=provider.id,
+        requested_doctor_id=payload.doctor_id,
+        current_user=current_user,
+    )
 
     if not payload.is_closed:
         if payload.start_time is None or payload.end_time is None:
@@ -189,7 +273,7 @@ def create_or_update_exception(
         db.query(ProviderAvailabilityException)
         .filter(
             ProviderAvailabilityException.provider_id == provider.id,
-            ProviderAvailabilityException.doctor_id == payload.doctor_id,
+            ProviderAvailabilityException.doctor_id == effective_doctor_id,
             ProviderAvailabilityException.date == payload.date,
         )
         .first()
@@ -206,7 +290,7 @@ def create_or_update_exception(
 
     exception = ProviderAvailabilityException(
         provider_id=provider.id,
-        doctor_id=payload.doctor_id,
+        doctor_id=effective_doctor_id,
         date=payload.date,
         is_closed=payload.is_closed,
         start_time=None if payload.is_closed else payload.start_time,
@@ -230,20 +314,25 @@ def delete_exception(
     current_user=Depends(get_current_user),
 ):
     provider = _get_my_provider(db, current_user)
+    membership = _get_my_active_membership(db, current_user)
 
-    row = (
-        db.query(ProviderAvailabilityException)
-        .filter(
-            ProviderAvailabilityException.id == exception_id,
-            ProviderAvailabilityException.provider_id == provider.id,
-        )
-        .first()
+    query = db.query(ProviderAvailabilityException).filter(
+        ProviderAvailabilityException.id == exception_id,
+        ProviderAvailabilityException.provider_id == provider.id,
     )
+
+    if membership and membership.provider_doctor_id is not None:
+        query = query.filter(
+            ProviderAvailabilityException.doctor_id == membership.provider_doctor_id
+        )
+
+    row = query.first()
     if not row:
         raise HTTPException(status_code=404, detail="Exception not found")
 
     db.delete(row)
     db.commit()
+
     return {
         "ok": True,
         "id": exception_id,
