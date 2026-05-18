@@ -14,8 +14,10 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.responses import FileResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
 
 from app import models
 from app.core.security import get_current_provider_for_user, get_current_user
@@ -25,6 +27,7 @@ from app.schemas.medical_document import MedicalDocumentOut
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 UPLOAD_DIR = Path("uploads/documents")
+MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
 ALLOWED_MIME_TYPES = {"application/pdf"}
 STAFF_ROLES = {"clinic_admin", "doctor", "assistant", "reception", "receptionist"}
 REFERRAL_ACCESS_STATUSES = {"pending", "accepted", "in_progress", "completed"}
@@ -68,6 +71,13 @@ def _get_accessible_clinic_ids(db: Session, current_user) -> List[int]:
             clinic_ids.append(clinic_id)
 
     return clinic_ids
+
+
+def _raise_platform_admin_document_access_denied():
+    raise HTTPException(
+        status_code=403,
+        detail="Platform admin is not allowed to access medical document content",
+    )
 
 
 def _ensure_episode_exists(db: Session, episode_id: int):
@@ -224,7 +234,7 @@ def _provider_can_access_episode(db: Session, current_user, episode) -> bool:
 
 def _ensure_episode_access(db: Session, current_user, episode) -> None:
     if current_user.role == "admin":
-        return
+        _raise_platform_admin_document_access_denied()
 
     if current_user.role == "patient":
         patient = _get_my_patient_profile(db, current_user)
@@ -244,7 +254,7 @@ def _ensure_episode_access(db: Session, current_user, episode) -> None:
 
 def _ensure_appointment_access(db: Session, current_user, appointment) -> None:
     if current_user.role == "admin":
-        return
+        _raise_platform_admin_document_access_denied()
 
     if current_user.role == "patient":
         patient = _get_my_patient_profile(db, current_user)
@@ -285,6 +295,15 @@ def _ensure_appointment_access(db: Session, current_user, appointment) -> None:
                     return
 
     raise HTTPException(status_code=403, detail="Not allowed")
+
+
+def _ensure_document_access(db: Session, current_user, doc) -> None:
+    episode = _ensure_episode_exists(db, doc.episode_id)
+    _ensure_episode_access(db, current_user, episode)
+
+    if doc.appointment_id is not None:
+        appointment = _ensure_appointment_exists(db, doc.appointment_id)
+        _ensure_appointment_access(db, current_user, appointment)
 
 
 def _resolve_episode_and_appointment(
@@ -328,24 +347,56 @@ def _resolve_episode_and_appointment(
     )
 
 
-def _save_upload(file: UploadFile) -> str:
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+def _validate_upload_file(file: UploadFile) -> None:
+    if file.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are allowed",
+        )
 
     ext = Path(file.filename or "").suffix.lower()
     if ext != ".pdf":
-        ext = ".pdf"
+        raise HTTPException(
+            status_code=400,
+            detail="Only .pdf files are allowed",
+        )
 
-    stored_name = f"{uuid4().hex}{ext}"
+
+def _save_upload(file: UploadFile) -> str:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    stored_name = f"{uuid4().hex}.pdf"
     destination = UPLOAD_DIR / stored_name
+
+    total_size = 0
 
     with destination.open("wb") as out:
         while True:
             chunk = file.file.read(1024 * 1024)
             if not chunk:
                 break
+
+            total_size += len(chunk)
+            if total_size > MAX_UPLOAD_SIZE_BYTES:
+                out.close()
+                destination.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413,
+                    detail="File is too large. Maximum allowed size is 10 MB.",
+                )
+
             out.write(chunk)
 
+    if total_size == 0:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
     return stored_name
+
+
+def _document_api_url(request: Request, document_id: int) -> str:
+    base_url = str(request.base_url).rstrip("/")
+    return f"{base_url}/api/v1/documents/{document_id}/download"
 
 
 def _create_document_record(
@@ -357,11 +408,7 @@ def _create_document_record(
     appointment,
     file: UploadFile,
 ):
-    if file.content_type not in ALLOWED_MIME_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are allowed",
-        )
+    _validate_upload_file(file)
 
     _ensure_episode_access(db, current_user, episode)
     if appointment is not None:
@@ -370,21 +417,24 @@ def _create_document_record(
     original_name = (file.filename or "").strip() or "document.pdf"
     stored_name = _save_upload(file)
 
-    base_url = str(request.base_url).rstrip("/")
-    file_url = f"{base_url}/uploads/documents/{stored_name}"
-
     doc = models.MedicalDocument(
         episode_id=episode.id,
         appointment_id=appointment.id if appointment else None,
         uploaded_by_user_id=current_user.id,
         file_name=original_name,
         stored_name=stored_name,
-        file_url=file_url,
+        file_url="pending",
         mime_type="application/pdf",
     )
     db.add(doc)
     db.commit()
     db.refresh(doc)
+
+    doc.file_url = _document_api_url(request, doc.id)
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+
     return doc
 
 
@@ -416,19 +466,43 @@ def upload_document(
 @router.get("/{document_id}", response_model=MedicalDocumentOut)
 def get_document(
     document_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     doc = _ensure_document_exists(db, document_id)
+    _ensure_document_access(db, current_user, doc)
 
-    episode = _ensure_episode_exists(db, doc.episode_id)
-    _ensure_episode_access(db, current_user, episode)
-
-    if doc.appointment_id is not None:
-        appointment = _ensure_appointment_exists(db, doc.appointment_id)
-        _ensure_appointment_access(db, current_user, appointment)
+    if not doc.file_url or "/uploads/documents/" in doc.file_url:
+        doc.file_url = _document_api_url(request, doc.id)
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
 
     return doc
+
+
+@router.get("/{document_id}/download")
+def download_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    doc = _ensure_document_exists(db, document_id)
+    _ensure_document_access(db, current_user, doc)
+
+    safe_stored_name = Path(doc.stored_name).name
+    file_path = UPLOAD_DIR / safe_stored_name
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Stored file not found")
+
+    return FileResponse(
+        path=file_path,
+        media_type=doc.mime_type or "application/pdf",
+        filename=doc.file_name or "medical-document.pdf",
+        background=BackgroundTask(lambda: None),
+    )
 
 
 @router.post(
@@ -475,6 +549,7 @@ def upload_document_for_episode(
 @router.get("/episodes/{episode_id}", response_model=List[MedicalDocumentOut])
 def list_episode_documents(
     episode_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
@@ -490,6 +565,12 @@ def list_episode_documents(
         )
         .all()
     )
+
+    for doc in rows:
+        if not doc.file_url or "/uploads/documents/" in doc.file_url:
+            doc.file_url = _document_api_url(request, doc.id)
+
+    db.commit()
     return rows
 
 
@@ -499,6 +580,7 @@ def list_episode_documents(
 )
 def list_documents_for_episode_alias(
     episode_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
@@ -514,12 +596,19 @@ def list_documents_for_episode_alias(
         )
         .all()
     )
+
+    for doc in rows:
+        if not doc.file_url or "/uploads/documents/" in doc.file_url:
+            doc.file_url = _document_api_url(request, doc.id)
+
+    db.commit()
     return rows
 
 
 @router.get("/appointments/{appointment_id}", response_model=List[MedicalDocumentOut])
 def list_appointment_documents(
     appointment_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
@@ -535,4 +624,10 @@ def list_appointment_documents(
         )
         .all()
     )
+
+    for doc in rows:
+        if not doc.file_url or "/uploads/documents/" in doc.file_url:
+            doc.file_url = _document_api_url(request, doc.id)
+
+    db.commit()
     return rows
