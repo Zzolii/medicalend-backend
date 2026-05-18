@@ -4,7 +4,6 @@ import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from app import models  # noqa: F401
 from app.api.v1.admin import router as admin_router
@@ -49,8 +48,6 @@ app.add_middleware(
 def read_root():
     return {"message": "MediCalend API is running"}
 
-
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
 app.include_router(users_router, prefix=settings.API_V1_PREFIX)
