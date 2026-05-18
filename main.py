@@ -1,9 +1,13 @@
 # Path: backend/main.py
 
 import os
+import time
+from collections import defaultdict, deque
+from typing import Deque, Dict, Tuple
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app import models  # noqa: F401
 from app.api.v1.admin import router as admin_router
@@ -45,6 +49,90 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept", "Origin"],
 )
+
+RateLimitKey = Tuple[str, str]
+rate_limit_store: Dict[RateLimitKey, Deque[float]] = defaultdict(deque)
+
+
+def _client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return "unknown"
+
+
+def _rate_limit_bucket(path: str, method: str) -> tuple[str, int]:
+    normalized_path = path.rstrip("/") or "/"
+    normalized_method = method.upper()
+
+    if normalized_method == "OPTIONS":
+        return "preflight", settings.RATE_LIMIT_GENERAL_PER_MINUTE * 2
+
+    if normalized_path.endswith("/auth/login"):
+        return "auth-login", settings.RATE_LIMIT_AUTH_PER_MINUTE
+
+    if normalized_path.endswith("/auth/forgot-password"):
+        return "auth-password-reset", settings.RATE_LIMIT_PASSWORD_RESET_PER_MINUTE
+
+    if normalized_path.endswith("/auth/resend-verification"):
+        return "auth-resend-verification", settings.RATE_LIMIT_PASSWORD_RESET_PER_MINUTE
+
+    if normalized_method == "POST" and "/documents" in normalized_path:
+        return "document-upload", settings.RATE_LIMIT_UPLOAD_PER_MINUTE
+
+    return "general", settings.RATE_LIMIT_GENERAL_PER_MINUTE
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if not settings.ENABLE_RATE_LIMITING:
+        return await call_next(request)
+
+    bucket, limit = _rate_limit_bucket(request.url.path, request.method)
+
+    if bucket == "preflight":
+        return await call_next(request)
+
+    now = time.time()
+    window_start = now - 60
+    ip = _client_ip(request)
+    key = (ip, bucket)
+
+    requests = rate_limit_store[key]
+
+    while requests and requests[0] < window_start:
+        requests.popleft()
+
+    if len(requests) >= limit:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": "Too many requests. Please try again later.",
+                "bucket": bucket,
+            },
+            headers={"Retry-After": "60"},
+        )
+
+    requests.append(now)
+
+    if len(rate_limit_store) > 10000:
+        stale_keys = [
+            stored_key
+            for stored_key, timestamps in rate_limit_store.items()
+            if not timestamps or timestamps[-1] < window_start
+        ]
+        for stale_key in stale_keys[:1000]:
+            rate_limit_store.pop(stale_key, None)
+
+    return await call_next(request)
 
 
 @app.get("/")

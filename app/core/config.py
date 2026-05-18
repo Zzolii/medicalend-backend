@@ -27,6 +27,13 @@ class Settings(BaseSettings):
         "https://app.medicalend.ro"
     )
 
+    # Rate limiting
+    ENABLE_RATE_LIMITING: bool = True
+    RATE_LIMIT_GENERAL_PER_MINUTE: int = 180
+    RATE_LIMIT_AUTH_PER_MINUTE: int = 10
+    RATE_LIMIT_PASSWORD_RESET_PER_MINUTE: int = 5
+    RATE_LIMIT_UPLOAD_PER_MINUTE: int = 20
+
     # JWT / Auth
     SECRET_KEY: str = "CHANGE_THIS_LATER_TO_A_LONG_RANDOM_STRING"
     ALGORITHM: str = "HS256"
