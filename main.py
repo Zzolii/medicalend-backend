@@ -6,10 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.core.config import settings
-print("GOOGLE_CLIENT_ID:", settings.GOOGLE_CLIENT_ID[:12] if settings.GOOGLE_CLIENT_ID else "EMPTY")
-print("GOOGLE_CLIENT_SECRET:", "SET" if settings.GOOGLE_CLIENT_SECRET else "EMPTY")
-
+from app import models  # noqa: F401
 from app.api.v1.admin import router as admin_router
 from app.api.v1.appointments import router as appointments_router
 from app.api.v1.auth import router as auth_router
@@ -27,10 +24,9 @@ from app.api.v1.providers import router as providers_router
 from app.api.v1.referrals import router as referrals_router
 from app.api.v1.subscriptions import router as subscriptions_router
 from app.api.v1.users import router as users_router
-
-from app import models  # noqa: F401
-from app.models.medical_document import MedicalDocument  # noqa: F401
+from app.core.config import settings
 from app.models.google_calendar_integration import GoogleCalendarIntegration  # noqa: F401
+from app.models.medical_document import MedicalDocument  # noqa: F401
 
 os.makedirs("uploads/documents", exist_ok=True)
 os.makedirs("uploads/provider-images", exist_ok=True)
@@ -42,16 +38,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost",
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://localhost:5173",
-        "*",
-    ],
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "Origin"],
 )
 
 
@@ -65,7 +55,6 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
 app.include_router(users_router, prefix=settings.API_V1_PREFIX)
 app.include_router(patients_router, prefix=settings.API_V1_PREFIX)
-
 app.include_router(appointments_router, prefix=settings.API_V1_PREFIX)
 app.include_router(care_episodes_router, prefix=settings.API_V1_PREFIX)
 app.include_router(referrals_router, prefix=settings.API_V1_PREFIX)
@@ -73,13 +62,10 @@ app.include_router(dashboard_router, prefix=settings.API_V1_PREFIX)
 app.include_router(patient_portal_router, prefix=settings.API_V1_PREFIX)
 app.include_router(admin_router, prefix=settings.API_V1_PREFIX)
 app.include_router(documents_router, prefix=settings.API_V1_PREFIX)
-
 app.include_router(provider_availability_router, prefix=settings.API_V1_PREFIX)
 app.include_router(provider_free_slots_router, prefix=settings.API_V1_PREFIX)
 app.include_router(provider_structure_router, prefix=settings.API_V1_PREFIX)
 app.include_router(providers_router, prefix=settings.API_V1_PREFIX)
-
 app.include_router(subscriptions_router, prefix=settings.API_V1_PREFIX)
 app.include_router(billing_router, prefix=settings.API_V1_PREFIX)
-
 app.include_router(google_calendar_router, prefix=settings.API_V1_PREFIX)
