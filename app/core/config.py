@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     # Environment
     ENVIRONMENT: str = "local"
 
+    # API documentation
+    ENABLE_API_DOCS: bool = True
+
     # CORS
     BACKEND_CORS_ORIGINS: str = (
         "http://localhost,"
@@ -64,6 +67,12 @@ class Settings(BaseSettings):
             for origin in self.BACKEND_CORS_ORIGINS.split(",")
             if origin.strip()
         ]
+
+    @property
+    def api_docs_enabled(self) -> bool:
+        if self.ENVIRONMENT.strip().lower() == "production":
+            return self.ENABLE_API_DOCS
+        return True
 
     class Config:
         env_file = ".env"
