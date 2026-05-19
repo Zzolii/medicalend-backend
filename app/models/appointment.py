@@ -59,6 +59,8 @@ class Appointment(Base):
     status = Column(String, nullable=False, default="scheduled")
     notes = Column(String, nullable=True)
 
+    reminder_email_sent_at = Column(DateTime(timezone=True), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     patient = relationship("Patient", backref="appointments")
