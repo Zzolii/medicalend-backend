@@ -1,9 +1,10 @@
 # Path: backend/app/api/v1/appointments.py
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import List, Optional, Union
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
@@ -40,6 +41,8 @@ DOCTOR_ROLE = "doctor"
 ASSISTANT_ROLE = "assistant"
 STAFF_VIEW_ROLES = CLINIC_WIDE_VIEW_ROLES | {DOCTOR_ROLE, ASSISTANT_ROLE}
 STAFF_BOOKING_ROLES = CLINIC_WIDE_BOOKING_ROLES | {DOCTOR_ROLE, ASSISTANT_ROLE}
+
+BUCHAREST_TZ = ZoneInfo("Europe/Bucharest")
 
 
 def _normalize_clinic_role(value: Optional[str]) -> Optional[str]:
@@ -286,6 +289,27 @@ def _naive_dt(v: Optional[Union[str, datetime]]) -> Optional[datetime]:
         v = v.astimezone(timezone.utc).replace(tzinfo=None)
 
     return v
+
+
+def _bucharest_day_range_as_utc_naive(target_date: Optional[str] = None) -> tuple[datetime, datetime]:
+    if target_date:
+        try:
+            selected_date = date.fromisoformat(target_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid date format. Use YYYY-MM-DD.",
+            ) from exc
+    else:
+        selected_date = datetime.now(BUCHAREST_TZ).date()
+
+    start_local = datetime.combine(selected_date, time.min, tzinfo=BUCHAREST_TZ)
+    end_local = start_local + timedelta(days=1)
+
+    start_utc_naive = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc_naive = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+
+    return start_utc_naive, end_utc_naive
 
 
 def _patient_display_name(patient: Optional[PatientModel]) -> Optional[str]:
@@ -906,6 +930,50 @@ def search_appointments(
         query = query.filter(AppointmentModel.start_time <= start_to)
 
     rows = query.order_by(AppointmentModel.start_time.desc()).all()
+    return _serialize_appointments(db, rows)
+
+
+@router.get("/today", response_model=List[Appointment])
+def list_today_appointments(
+    date_value: Optional[str] = Query(
+        None,
+        alias="date",
+        description="Optional date in YYYY-MM-DD format. Defaults to today in Europe/Bucharest.",
+    ),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    if current_user.role == "admin":
+        _raise_platform_admin_appointment_access_denied()
+
+    start_utc_naive, end_utc_naive = _bucharest_day_range_as_utc_naive(date_value)
+
+    if current_user.role == "patient":
+        patient = _get_my_patient_profile(db, current_user)
+        query = db.query(AppointmentModel).filter(AppointmentModel.patient_id == patient.id)
+
+    else:
+        scope = _get_staff_scope(db, current_user)
+        clinic_ids = scope["clinic_ids"]
+
+        if clinic_ids:
+            query = _clinic_visible_appointments_query(
+                db,
+                clinic_ids,
+                doctor_ids=scope["doctor_ids"],
+                clinic_wide=scope["has_clinic_wide_access"],
+            )
+        else:
+            provider = _get_my_provider_profile(db, current_user)
+            query = _provider_visible_appointments_query(db, provider.id)
+
+    rows = (
+        query.filter(AppointmentModel.start_time >= start_utc_naive)
+        .filter(AppointmentModel.start_time < end_utc_naive)
+        .order_by(AppointmentModel.start_time.asc())
+        .all()
+    )
+
     return _serialize_appointments(db, rows)
 
 
