@@ -29,7 +29,9 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 UPLOAD_DIR = Path("uploads/documents")
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
 ALLOWED_MIME_TYPES = {"application/pdf"}
+
 STAFF_ROLES = {"clinic_admin", "doctor", "assistant", "reception", "receptionist"}
+DOCUMENT_UPLOAD_ROLES = {"clinic_admin", "doctor", "assistant"}
 REFERRAL_ACCESS_STATUSES = {"pending", "accepted", "in_progress", "completed"}
 
 
@@ -37,6 +39,23 @@ def _normalize_clinic_role(value: Optional[str]) -> Optional[str]:
     if value == "receptionist":
         return "reception"
     return value
+
+
+def _raise_platform_admin_document_access_denied():
+    raise HTTPException(
+        status_code=403,
+        detail="Platform admin is not allowed to access medical document content",
+    )
+
+
+def _raise_read_only_episode():
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Acest episod aparține altei relații clinice. Îl poți consulta "
+            "doar în modul read-only, fără încărcare sau modificare de documente."
+        ),
+    )
 
 
 def _get_my_patient_profile(db: Session, current_user):
@@ -53,8 +72,8 @@ def _get_my_patient_profile(db: Session, current_user):
     return patient
 
 
-def _get_accessible_clinic_ids(db: Session, current_user) -> List[int]:
-    memberships = (
+def _get_active_staff_memberships(db: Session, current_user):
+    return (
         db.query(models.ClinicMembership)
         .filter(
             models.ClinicMembership.user_id == current_user.id,
@@ -62,6 +81,10 @@ def _get_accessible_clinic_ids(db: Session, current_user) -> List[int]:
         )
         .all()
     )
+
+
+def _get_accessible_clinic_ids(db: Session, current_user) -> List[int]:
+    memberships = _get_active_staff_memberships(db, current_user)
 
     clinic_ids: List[int] = []
     for membership in memberships:
@@ -73,11 +96,22 @@ def _get_accessible_clinic_ids(db: Session, current_user) -> List[int]:
     return clinic_ids
 
 
-def _raise_platform_admin_document_access_denied():
-    raise HTTPException(
-        status_code=403,
-        detail="Platform admin is not allowed to access medical document content",
-    )
+def _get_upload_allowed_clinic_ids(db: Session, current_user) -> List[int]:
+    memberships = _get_active_staff_memberships(db, current_user)
+
+    clinic_ids: List[int] = []
+    for membership in memberships:
+        role = _normalize_clinic_role(getattr(membership, "role", None))
+        clinic_id = getattr(membership, "clinic_id", None)
+
+        if (
+            role in DOCUMENT_UPLOAD_ROLES
+            and clinic_id is not None
+            and clinic_id not in clinic_ids
+        ):
+            clinic_ids.append(clinic_id)
+
+    return clinic_ids
 
 
 def _ensure_episode_exists(db: Session, episode_id: int):
@@ -113,6 +147,28 @@ def _ensure_document_exists(db: Session, document_id: int):
     return doc
 
 
+def _get_provider_by_id(db: Session, provider_id: Optional[int]):
+    if provider_id is None:
+        return None
+
+    return (
+        db.query(models.Provider)
+        .filter(models.Provider.id == provider_id)
+        .first()
+    )
+
+
+def _get_episode_owner_provider(db: Session, episode):
+    return _get_provider_by_id(db, getattr(episode, "owner_provider_id", None))
+
+
+def _get_episode_owner_clinic_id(db: Session, episode) -> Optional[int]:
+    provider = _get_episode_owner_provider(db, episode)
+    if not provider:
+        return None
+    return getattr(provider, "clinic_id", None)
+
+
 def _ensure_appointment_matches_episode(
     db: Session,
     episode_id: int,
@@ -136,12 +192,8 @@ def _clinic_staff_can_access_episode(db: Session, episode, clinic_ids: List[int]
     if not clinic_ids:
         return False
 
-    owner_provider = (
-        db.query(models.Provider)
-        .filter(models.Provider.id == episode.owner_provider_id)
-        .first()
-    )
-    if owner_provider and getattr(owner_provider, "clinic_id", None) in clinic_ids:
+    owner_clinic_id = _get_episode_owner_clinic_id(db, episode)
+    if owner_clinic_id in clinic_ids:
         return True
 
     referral_provider_ids = (
@@ -232,6 +284,27 @@ def _provider_can_access_episode(db: Session, current_user, episode) -> bool:
     return appointment is not None
 
 
+def _provider_can_upload_to_episode(db: Session, current_user, episode) -> bool:
+    try:
+        my_provider = get_current_provider_for_user(db, current_user)
+    except HTTPException:
+        return False
+
+    return episode.owner_provider_id == my_provider.id
+
+
+def _clinic_staff_can_upload_to_episode(db: Session, current_user, episode) -> bool:
+    upload_clinic_ids = _get_upload_allowed_clinic_ids(db, current_user)
+    if not upload_clinic_ids:
+        return False
+
+    owner_clinic_id = _get_episode_owner_clinic_id(db, episode)
+    if owner_clinic_id is None:
+        return False
+
+    return owner_clinic_id in upload_clinic_ids
+
+
 def _ensure_episode_access(db: Session, current_user, episode) -> None:
     if current_user.role == "admin":
         _raise_platform_admin_document_access_denied()
@@ -250,6 +323,25 @@ def _ensure_episode_access(db: Session, current_user, episode) -> None:
         return
 
     raise HTTPException(status_code=403, detail="Not allowed")
+
+
+def _ensure_episode_upload_access(db: Session, current_user, episode) -> None:
+    if current_user.role == "admin":
+        _raise_platform_admin_document_access_denied()
+
+    if current_user.role == "patient":
+        patient = _get_my_patient_profile(db, current_user)
+        if episode.patient_id != patient.id:
+            raise HTTPException(status_code=403, detail="Not allowed")
+        return
+
+    if _clinic_staff_can_upload_to_episode(db, current_user, episode):
+        return
+
+    if _provider_can_upload_to_episode(db, current_user, episode):
+        return
+
+    _raise_read_only_episode()
 
 
 def _ensure_appointment_access(db: Session, current_user, appointment) -> None:
@@ -295,6 +387,44 @@ def _ensure_appointment_access(db: Session, current_user, appointment) -> None:
                     return
 
     raise HTTPException(status_code=403, detail="Not allowed")
+
+
+def _ensure_appointment_upload_access(db: Session, current_user, appointment) -> None:
+    if current_user.role == "admin":
+        _raise_platform_admin_document_access_denied()
+
+    if current_user.role == "patient":
+        patient = _get_my_patient_profile(db, current_user)
+        if appointment.patient_id != patient.id:
+            raise HTTPException(status_code=403, detail="Not allowed")
+        return
+
+    if appointment.episode_id is not None:
+        episode = _ensure_episode_exists(db, appointment.episode_id)
+        _ensure_episode_upload_access(db, current_user, episode)
+        return
+
+    clinic_ids = _get_upload_allowed_clinic_ids(db, current_user)
+
+    provider_clinic_id = None
+    if appointment.provider_id is not None:
+        provider = _get_provider_by_id(db, appointment.provider_id)
+        provider_clinic_id = getattr(provider, "clinic_id", None) if provider else None
+
+    appointment_clinic_id = getattr(appointment, "clinic_id", None)
+    if appointment_clinic_id in clinic_ids or provider_clinic_id in clinic_ids:
+        return
+
+    if current_user.role == "provider":
+        try:
+            my_provider = get_current_provider_for_user(db, current_user)
+        except HTTPException:
+            my_provider = None
+
+        if my_provider and appointment.provider_id == my_provider.id:
+            return
+
+    _raise_read_only_episode()
 
 
 def _ensure_document_access(db: Session, current_user, doc) -> None:
@@ -410,9 +540,9 @@ def _create_document_record(
 ):
     _validate_upload_file(file)
 
-    _ensure_episode_access(db, current_user, episode)
+    _ensure_episode_upload_access(db, current_user, episode)
     if appointment is not None:
-        _ensure_appointment_access(db, current_user, appointment)
+        _ensure_appointment_upload_access(db, current_user, appointment)
 
     original_name = (file.filename or "").strip() or "document.pdf"
     stored_name = _save_upload(file)
