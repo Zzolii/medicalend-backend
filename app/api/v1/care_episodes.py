@@ -22,6 +22,7 @@ router = APIRouter(prefix="/care-episodes", tags=["care-episodes"])
 
 REFERRAL_ACCESS_STATUSES = ("accepted", "in_progress", "completed", "pending")
 CLINIC_WIDE_ROLES = {"clinic_admin", "assistant", "reception", "receptionist"}
+EPISODE_WRITE_CLINIC_ROLES = {"clinic_admin", "assistant"}
 DOCTOR_ROLE = "doctor"
 STAFF_VIEW_ROLES = CLINIC_WIDE_ROLES | {DOCTOR_ROLE}
 
@@ -53,6 +54,16 @@ def _raise_access_denied() -> None:
     raise HTTPException(
         status_code=403,
         detail="Nu ai acces la acest episod medical.",
+    )
+
+
+def _raise_read_only_episode() -> None:
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Acest episod aparține altei relații clinice. Îl poți consulta "
+            "doar în modul read-only, fără modificări sau încărcări de documente."
+        ),
     )
 
 
@@ -104,6 +115,27 @@ def _get_episode_or_404(db: Session, episode_id: int) -> models.CareEpisode:
     return ep
 
 
+def _get_episode_owner_provider(
+    db: Session,
+    episode: models.CareEpisode,
+) -> Optional[models.Provider]:
+    return (
+        db.query(models.Provider)
+        .filter(models.Provider.id == episode.owner_provider_id)
+        .first()
+    )
+
+
+def _get_episode_owner_clinic_id(
+    db: Session,
+    episode: models.CareEpisode,
+) -> Optional[int]:
+    owner_provider = _get_episode_owner_provider(db, episode)
+    if not owner_provider:
+        return None
+    return getattr(owner_provider, "clinic_id", None)
+
+
 def _build_staff_scope(db: Session, current_user) -> Dict[str, Any]:
     memberships = (
         db.query(models.ClinicMembership)
@@ -116,7 +148,9 @@ def _build_staff_scope(db: Session, current_user) -> Dict[str, Any]:
 
     clinic_ids: Set[int] = set()
     clinic_wide_clinic_ids: Set[int] = set()
+    episode_write_clinic_ids: Set[int] = set()
     doctor_ids: Set[int] = set()
+    doctor_clinic_ids: Set[int] = set()
     clinic_roles: Set[str] = set()
 
     for membership in memberships:
@@ -134,14 +168,21 @@ def _build_staff_scope(db: Session, current_user) -> Dict[str, Any]:
         if role in CLINIC_WIDE_ROLES:
             clinic_wide_clinic_ids.add(clinic_id)
 
+        if role in EPISODE_WRITE_CLINIC_ROLES:
+            episode_write_clinic_ids.add(clinic_id)
+
         provider_doctor_id = getattr(membership, "provider_doctor_id", None)
-        if role == DOCTOR_ROLE and provider_doctor_id:
-            doctor_ids.add(provider_doctor_id)
+        if role == DOCTOR_ROLE:
+            doctor_clinic_ids.add(clinic_id)
+            if provider_doctor_id:
+                doctor_ids.add(provider_doctor_id)
 
     return {
         "clinic_ids": list(clinic_ids),
         "clinic_wide_clinic_ids": list(clinic_wide_clinic_ids),
+        "episode_write_clinic_ids": list(episode_write_clinic_ids),
         "doctor_ids": list(doctor_ids),
+        "doctor_clinic_ids": list(doctor_clinic_ids),
         "clinic_roles": list(clinic_roles),
     }
 
@@ -160,9 +201,7 @@ def _episode_ids_from_provider_referrals_subquery(db: Session, provider_id: int)
     )
 
 
-def _episode_ids_from_clinic_referrals_subquery(
-    db: Session, clinic_ids: List[int]
-):
+def _episode_ids_from_clinic_referrals_subquery(db: Session, clinic_ids: List[int]):
     clinic_provider_ids = (
         db.query(models.Provider.id.label("provider_id"))
         .filter(models.Provider.clinic_id.in_(clinic_ids))
@@ -187,7 +226,8 @@ def _episode_ids_from_clinic_referrals_subquery(
 
 
 def _episode_ids_from_clinic_appointments_subquery(
-    db: Session, clinic_ids: List[int]
+    db: Session,
+    clinic_ids: List[int],
 ):
     clinic_provider_ids = (
         db.query(models.Provider.id.label("provider_id"))
@@ -210,9 +250,7 @@ def _episode_ids_from_clinic_appointments_subquery(
     )
 
 
-def _episode_ids_from_doctor_appointments_subquery(
-    db: Session, doctor_ids: List[int]
-):
+def _episode_ids_from_doctor_appointments_subquery(db: Session, doctor_ids: List[int]):
     return (
         db.query(models.Appointment.episode_id.label("episode_id"))
         .filter(
@@ -224,7 +262,9 @@ def _episode_ids_from_doctor_appointments_subquery(
 
 
 def _provider_can_access_episode(
-    db: Session, episode: models.CareEpisode, provider_id: int
+    db: Session,
+    episode: models.CareEpisode,
+    provider_id: int,
 ) -> bool:
     if episode.owner_provider_id == provider_id:
         return True
@@ -263,11 +303,7 @@ def _clinic_staff_can_access_episode(
     doctor_ids: List[int],
 ) -> bool:
     if clinic_wide_clinic_ids:
-        owner_provider = (
-            db.query(models.Provider)
-            .filter(models.Provider.id == episode.owner_provider_id)
-            .first()
-        )
+        owner_provider = _get_episode_owner_provider(db, episode)
         if (
             owner_provider
             and getattr(owner_provider, "clinic_id", None)
@@ -331,6 +367,40 @@ def _clinic_staff_can_access_episode(
     return False
 
 
+def _clinic_staff_can_write_episode(
+    db: Session,
+    episode: models.CareEpisode,
+    current_user,
+) -> bool:
+    staff_scope = _build_staff_scope(db, current_user)
+    clinic_roles = set(staff_scope["clinic_roles"])
+
+    if "reception" in clinic_roles:
+        return False
+
+    owner_clinic_id = _get_episode_owner_clinic_id(db, episode)
+    if owner_clinic_id is None:
+        return False
+
+    if owner_clinic_id in staff_scope["episode_write_clinic_ids"]:
+        return True
+
+    if owner_clinic_id in staff_scope["doctor_clinic_ids"]:
+        return True
+
+    return False
+
+
+def _provider_can_write_episode(
+    provider: Optional[models.Provider],
+    episode: models.CareEpisode,
+) -> bool:
+    if not provider:
+        return False
+
+    return episode.owner_provider_id == provider.id
+
+
 def _ensure_episode_access(db: Session, episode: models.CareEpisode, current_user):
     if current_user.role == "admin":
         _raise_platform_admin_medical_access_denied()
@@ -358,7 +428,9 @@ def _ensure_episode_access(db: Session, episode: models.CareEpisode, current_use
 
 
 def _ensure_episode_write_access(
-    db: Session, episode: models.CareEpisode, current_user
+    db: Session,
+    episode: models.CareEpisode,
+    current_user,
 ):
     if current_user.role == "admin":
         _raise_platform_admin_medical_access_denied()
@@ -370,6 +442,15 @@ def _ensure_episode_write_access(
         )
 
     _ensure_episode_access(db, episode, current_user)
+
+    if _clinic_staff_can_write_episode(db, episode, current_user):
+        return
+
+    provider = _try_get_my_provider_profile(db, current_user)
+    if _provider_can_write_episode(provider, episode):
+        return
+
+    _raise_read_only_episode()
 
 
 @router.post("/", response_model=CareEpisodeOut, status_code=status.HTTP_201_CREATED)
@@ -399,10 +480,12 @@ def create_episode(
             detail="Profilul de furnizor nu este asociat acestui cont.",
         )
 
+    title = payload.title.strip()
+
     episode = models.CareEpisode(
         patient_id=payload.patient_id,
         owner_provider_id=provider.id,
-        title=payload.title,
+        title=title,
         status="open",
     )
     db.add(episode)
@@ -531,6 +614,9 @@ def update_episode(
         )
         if not patient:
             raise HTTPException(status_code=400, detail="Pacientul nu există.")
+
+    if "title" in data and isinstance(data["title"], str):
+        data["title"] = data["title"].strip()
 
     for k, v in data.items():
         setattr(episode, k, v)
