@@ -18,6 +18,7 @@ from app.api.v1.care_episodes import router as care_episodes_router
 from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.documents import router as documents_router
 from app.api.v1.google_calendar import router as google_calendar_router
+from app.api.v1.home_care import router as home_care_router
 from app.api.v1.patient_portal import router as patient_portal_router
 from app.api.v1.patients import router as patients_router
 from app.api.v1.provider_availability import router as provider_availability_router
@@ -29,6 +30,7 @@ from app.api.v1.subscriptions import router as subscriptions_router
 from app.api.v1.users import router as users_router
 from app.core.config import settings
 from app.models.google_calendar_integration import GoogleCalendarIntegration  # noqa: F401
+from app.models.home_care import HomeCareCase, HomeCareVisit  # noqa: F401
 from app.models.medical_document import MedicalDocument  # noqa: F401
 
 os.makedirs("uploads/documents", exist_ok=True)
@@ -150,6 +152,7 @@ app.include_router(dashboard_router, prefix=settings.API_V1_PREFIX)
 app.include_router(patient_portal_router, prefix=settings.API_V1_PREFIX)
 app.include_router(admin_router, prefix=settings.API_V1_PREFIX)
 app.include_router(documents_router, prefix=settings.API_V1_PREFIX)
+app.include_router(home_care_router, prefix=settings.API_V1_PREFIX)
 app.include_router(provider_availability_router, prefix=settings.API_V1_PREFIX)
 app.include_router(provider_free_slots_router, prefix=settings.API_V1_PREFIX)
 app.include_router(provider_structure_router, prefix=settings.API_V1_PREFIX)

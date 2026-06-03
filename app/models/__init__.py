@@ -7,6 +7,7 @@ from app.models.care_task import CareTask
 from app.models.clinic import Clinic
 from app.models.clinic_membership import ClinicMembership
 from app.models.google_calendar_integration import GoogleCalendarIntegration
+from app.models.home_care import HomeCareCase, HomeCareVisit
 from app.models.medical_document import MedicalDocument
 from app.models.patient import Patient
 from app.models.provider import Provider
@@ -34,6 +35,8 @@ __all__ = [
     "Appointment",
     "Referral",
     "MedicalDocument",
+    "HomeCareCase",
+    "HomeCareVisit",
     "SubscriptionPlan",
     "ClinicSubscription",
     "GoogleCalendarIntegration",
