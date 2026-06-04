@@ -130,60 +130,14 @@ class HomeCareVisitOut(BaseModel):
     class Config:
         from_attributes = True
 
-        @router.get(
-            "/providers/{provider_id}/staff",
-            response_model=List[HomeCareStaffOut],
-        )
-        def list_home_care_provider_staff(
-                provider_id: int,
-                role: Optional[str] = Query(
-                    "assistant",
-                    description="Filter by clinic role. Defaults to assistant.",
-                ),
-                db: Session = Depends(get_db),
-                current_user=Depends(get_current_user),
-        ):
-            provider = (
-                db.query(models.Provider)
-                .filter(
-                    models.Provider.id == provider_id,
-                    models.Provider.is_active == True,  # noqa: E712
-                )
-                .first()
-            )
 
-            if not provider:
-                raise HTTPException(status_code=404, detail="Providerul nu a fost găsit.")
+class HomeCareStaffOut(BaseModel):
+    membership_id: int
+    user_id: int
+    clinic_id: int
+    role: str
+    display_name: str
+    email: Optional[str] = None
 
-            clinic_id = getattr(provider, "clinic_id", None)
-            if clinic_id is None:
-                return []
-
-            normalized_role = _normalize_clinic_role(role)
-
-            query = (
-                db.query(models.ClinicMembership, models.User)
-                .join(models.User, models.User.id == models.ClinicMembership.user_id)
-                .filter(
-                    models.ClinicMembership.clinic_id == clinic_id,
-                    models.ClinicMembership.is_active == True,  # noqa: E712
-                    models.User.is_active == True,  # noqa: E712
-                )
-            )
-
-            if normalized_role:
-                query = query.filter(models.ClinicMembership.role == normalized_role)
-
-            rows = query.order_by(models.User.email.asc()).all()
-
-            return [
-                HomeCareStaffOut(
-                    membership_id=membership.id,
-                    user_id=user.id,
-                    clinic_id=membership.clinic_id,
-                    role=_normalize_clinic_role(membership.role) or membership.role,
-                    display_name=user.email.split("@")[0] if user.email else f"User #{user.id}",
-                    email=user.email,
-                )
-                for membership, user in rows
-            ]
+    class Config:
+        from_attributes = True
