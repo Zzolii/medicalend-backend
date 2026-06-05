@@ -497,9 +497,9 @@ def update_home_care_visit(
 )
 def list_home_care_provider_staff(
     provider_id: int,
-    role: Optional[str] = Query(
-        "assistant",
-        description="Filter by clinic role. Defaults to assistant.",
+role: Optional[str] = Query(
+    None,
+    description="Filter by clinic role. If empty, returns Home Care visible staff.",
     ),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
@@ -534,6 +534,8 @@ def list_home_care_provider_staff(
 
     if normalized_role:
         query = query.filter(models.ClinicMembership.role == normalized_role)
+    else:
+        query = query.filter(models.ClinicMembership.role.in_(["assistant", "doctor"]))
 
     rows = query.order_by(models.User.email.asc()).all()
 
