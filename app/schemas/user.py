@@ -31,6 +31,7 @@ class ClinicMembershipOut(BaseModel):
     clinic_id: int
     role: str
     provider_doctor_id: Optional[int] = None
+    display_name: Optional[str] = None
     is_active: bool
     created_at: datetime
 
@@ -55,6 +56,7 @@ class ClinicStaffCreate(BaseModel):
     password: str = Field(min_length=8, max_length=64)
     clinic_role: str = Field(min_length=3, max_length=50)
     provider_doctor_id: Optional[int] = None
+    display_name: Optional[str] = Field(default=None, max_length=120)
     is_active: bool = True
 
 
@@ -62,6 +64,7 @@ class ClinicStaffUpdate(BaseModel):
     email: Optional[EmailStr] = None
     clinic_role: Optional[str] = Field(default=None, min_length=3, max_length=50)
     provider_doctor_id: Optional[int] = None
+    display_name: Optional[str] = Field(default=None, max_length=120)
     is_active: Optional[bool] = None
     password: Optional[str] = Field(default=None, min_length=8, max_length=64)
 
@@ -77,6 +80,7 @@ class ClinicStaffRow(BaseModel):
     clinic_role: str
     provider_doctor_id: Optional[int] = None
     provider_doctor_name: Optional[str] = None
+    display_name: Optional[str] = None
     membership_is_active: bool
 
     created_at: datetime

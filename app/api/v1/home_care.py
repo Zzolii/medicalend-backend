@@ -5,7 +5,7 @@ from typing import List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app import models
 from app.core.security import get_current_user
@@ -14,8 +14,8 @@ from app.db import get_db
 from app.schemas.home_care import (
     HomeCareCaseCreate,
     HomeCareCaseOut,
-    HomeCareStaffOut,
     HomeCareCaseUpdate,
+    HomeCareStaffOut,
     HomeCareVisitCreate,
     HomeCareVisitOut,
     HomeCareVisitUpdate,
@@ -24,7 +24,13 @@ from app.schemas.home_care import (
 router = APIRouter(prefix="/home-care", tags=["home-care"])
 
 CLINIC_ROLES = {"clinic_admin", "doctor", "assistant", "reception", "receptionist"}
-HOME_CARE_WRITE_ROLES = {"clinic_admin", "doctor", "assistant", "reception", "receptionist"}
+HOME_CARE_WRITE_ROLES = {
+    "clinic_admin",
+    "doctor",
+    "assistant",
+    "reception",
+    "receptionist",
+}
 
 
 def _normalize_clinic_role(value: Optional[str]) -> Optional[str]:
@@ -71,7 +77,10 @@ def _get_provider_for_user(db: Session, current_user) -> Optional[models.Provide
         return None
 
     if getattr(provider, "status", None) != "approved":
-        raise HTTPException(status_code=403, detail="Profilul de furnizor nu este aprobat.")
+        raise HTTPException(
+            status_code=403,
+            detail="Profilul de furnizor nu este aprobat.",
+        )
 
     return provider
 
@@ -121,7 +130,9 @@ def _patient_ids_from_clinic_activity(db: Session, clinic_ids: List[int]) -> Set
         .filter(
             or_(
                 models.Appointment.clinic_id.in_(clinic_ids),
-                models.Appointment.provider_id.in_(provider_ids) if provider_ids else False,
+                models.Appointment.provider_id.in_(provider_ids)
+                if provider_ids
+                else False,
             )
         )
         .all()
@@ -231,7 +242,10 @@ def _ensure_patient_visible_for_staff(
         if provider and getattr(provider, "clinic_id", None) == clinic_id:
             return
 
-        raise HTTPException(status_code=403, detail="Nu poți crea caz Home Care pentru această clinică.")
+        raise HTTPException(
+            status_code=403,
+            detail="Nu poți crea caz Home Care pentru această clinică.",
+        )
 
     if provider:
         return
@@ -240,6 +254,25 @@ def _ensure_patient_visible_for_staff(
         return
 
     raise HTTPException(status_code=403, detail="Nu ai permisiunea de a crea caz Home Care.")
+
+
+def _home_care_staff_display_name(membership, user) -> str:
+    explicit_name = getattr(membership, "display_name", None)
+    if isinstance(explicit_name, str) and explicit_name.strip():
+        return explicit_name.strip()
+
+    doctor = getattr(membership, "provider_doctor", None)
+    if doctor:
+        title = getattr(doctor, "title", None) or ""
+        name = getattr(doctor, "name", None) or ""
+        doctor_name = f"{title} {name}".strip()
+        if doctor_name:
+            return doctor_name
+
+    if user.email:
+        return user.email.split("@")[0]
+
+    return f"User #{user.id}"
 
 
 @router.post("/cases", response_model=HomeCareCaseOut, status_code=status.HTTP_201_CREATED)
@@ -490,16 +523,15 @@ def update_home_care_visit(
     return visit
 
 
-
 @router.get(
     "/providers/{provider_id}/staff",
     response_model=List[HomeCareStaffOut],
 )
 def list_home_care_provider_staff(
     provider_id: int,
-role: Optional[str] = Query(
-    None,
-    description="Filter by clinic role. If empty, returns Home Care visible staff.",
+    role: Optional[str] = Query(
+        None,
+        description="Filter by clinic role. If empty, returns Home Care visible staff.",
     ),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
@@ -524,6 +556,7 @@ role: Optional[str] = Query(
 
     query = (
         db.query(models.ClinicMembership, models.User)
+        .options(joinedload(models.ClinicMembership.provider_doctor))
         .join(models.User, models.User.id == models.ClinicMembership.user_id)
         .filter(
             models.ClinicMembership.clinic_id == clinic_id,
@@ -537,7 +570,7 @@ role: Optional[str] = Query(
     else:
         query = query.filter(models.ClinicMembership.role.in_(["assistant", "doctor"]))
 
-    rows = query.order_by(models.User.email.asc()).all()
+    rows = query.order_by(models.ClinicMembership.role.asc(), models.User.email.asc()).all()
 
     return [
         HomeCareStaffOut(
@@ -545,9 +578,8 @@ role: Optional[str] = Query(
             user_id=user.id,
             clinic_id=membership.clinic_id,
             role=_normalize_clinic_role(membership.role) or membership.role,
-            display_name=user.email.split("@")[0] if user.email else f"User #{user.id}",
+            display_name=_home_care_staff_display_name(membership, user),
             email=user.email,
         )
         for membership, user in rows
     ]
-

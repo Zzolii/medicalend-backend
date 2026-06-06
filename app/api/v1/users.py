@@ -47,6 +47,12 @@ def _normalize_clinic_role(value: Optional[str]) -> Optional[str]:
     return value
 
 
+def _clean_optional_display_name(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
 def _get_my_active_clinic_admin_membership(
     db: Session,
     current_user,
@@ -287,6 +293,7 @@ def _serialize_staff_row(
         "provider_doctor_name": doctor_name,
         "membership_is_active": membership.is_active,
         "created_at": user.created_at,
+        "display_name": membership.display_name,
     }
 
 
@@ -499,6 +506,7 @@ def create_my_clinic_staff(
         role=clinic_role,
         provider_doctor_id=doctor.id if doctor else None,
         is_active=payload.is_active,
+        display_name=_clean_optional_display_name(payload.display_name),
     )
     db.add(membership)
     db.commit()
@@ -577,6 +585,9 @@ def update_my_clinic_staff(
 
     if "provider_doctor_id" in data or next_role != current_membership_role:
         membership.provider_doctor_id = doctor.id if doctor else None
+
+    if "display_name" in data:
+        membership.display_name = _clean_optional_display_name(data["display_name"])
 
     if "is_active" in data and data["is_active"] is not None:
         membership.is_active = data["is_active"]

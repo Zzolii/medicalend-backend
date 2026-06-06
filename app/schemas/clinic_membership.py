@@ -11,6 +11,7 @@ class ClinicMembershipBase(BaseModel):
     clinic_id: int
     role: str
     provider_doctor_id: Optional[int] = None
+    display_name: Optional[str] = None
     is_active: bool = True
 
 
@@ -21,6 +22,7 @@ class ClinicMembershipCreate(ClinicMembershipBase):
 class ClinicMembershipUpdate(BaseModel):
     role: Optional[str] = None
     provider_doctor_id: Optional[int] = None
+    display_name: Optional[str] = None
     is_active: Optional[bool] = None
 
 
