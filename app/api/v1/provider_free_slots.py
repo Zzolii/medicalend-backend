@@ -22,7 +22,8 @@ from app.models.provider_doctor import ProviderDoctor
 
 router = APIRouter(prefix="/providers", tags=["provider-free-slots"])
 
-SLOT_MINUTES = 30
+DEFAULT_SLOT_MINUTES = 30
+ALLOWED_SLOT_DURATIONS = {5, 10, 15, 20, 30}
 DEFAULT_START_TIME = time(8, 0)
 DEFAULT_END_TIME = time(16, 0)
 
@@ -34,6 +35,12 @@ def _normalize_clinic_role(value: Optional[str]) -> Optional[str]:
     if value == "receptionist":
         return "reception"
     return value
+
+
+def _safe_slot_minutes(value: Optional[int]) -> int:
+    if value in ALLOWED_SLOT_DURATIONS:
+        return int(value)
+    return DEFAULT_SLOT_MINUTES
 
 
 def _get_accessible_clinic_ids(db: Session, current_user) -> List[int]:
@@ -68,7 +75,10 @@ def _ensure_provider_access(db: Session, provider: Provider, current_user) -> No
     if current_user.role == "provider":
         my_provider = db.query(Provider).filter(Provider.user_id == current_user.id).first()
         if not my_provider:
-            raise HTTPException(status_code=404, detail="Provider profile not linked to this user")
+            raise HTTPException(
+                status_code=404,
+                detail="Provider profile not linked to this user",
+            )
         if my_provider.id != provider.id:
             raise HTTPException(status_code=403, detail="Not allowed for this provider")
         return
@@ -80,24 +90,41 @@ def combine_date_time(d: date, t: time) -> datetime:
     return datetime(d.year, d.month, d.day, t.hour, t.minute, t.second)
 
 
-def generate_base_slots(start_dt: datetime, end_dt: datetime) -> List[datetime]:
+def generate_base_slots(
+    start_dt: datetime,
+    end_dt: datetime,
+    slot_minutes: int,
+) -> List[datetime]:
     slots: List[datetime] = []
     current = start_dt
+    step = _safe_slot_minutes(slot_minutes)
 
-    while current + timedelta(minutes=SLOT_MINUTES) <= end_dt:
+    while current + timedelta(minutes=step) <= end_dt:
         slots.append(current)
-        current += timedelta(minutes=SLOT_MINUTES)
+        current += timedelta(minutes=step)
 
     return slots
 
 
-def _default_work_window(date_value: date) -> Optional[tuple[datetime, datetime]]:
+def _default_work_window(date_value: date) -> Optional[tuple[datetime, datetime, int]]:
     if date_value.weekday() >= 5:
         return None
 
     return (
         combine_date_time(date_value, DEFAULT_START_TIME),
         combine_date_time(date_value, DEFAULT_END_TIME),
+        DEFAULT_SLOT_MINUTES,
+    )
+
+
+def _availability_to_window(
+    date_value: date,
+    availability: ProviderAvailability,
+) -> tuple[datetime, datetime, int]:
+    return (
+        combine_date_time(date_value, availability.start_time),
+        combine_date_time(date_value, availability.end_time),
+        _safe_slot_minutes(getattr(availability, "slot_duration_minutes", None)),
     )
 
 
@@ -105,7 +132,7 @@ def _resolve_provider_work_window(
     db: Session,
     provider_id: int,
     date_value: date,
-) -> Optional[tuple[datetime, datetime]]:
+) -> Optional[tuple[datetime, datetime, int]]:
     provider_exception = (
         db.query(ProviderAvailabilityException)
         .filter(
@@ -121,9 +148,27 @@ def _resolve_provider_work_window(
             return None
 
         if provider_exception.start_time and provider_exception.end_time:
+            provider_availability = (
+                db.query(ProviderAvailability)
+                .filter(
+                    ProviderAvailability.provider_id == provider_id,
+                    ProviderAvailability.doctor_id.is_(None),
+                    ProviderAvailability.weekday == date_value.weekday(),
+                    ProviderAvailability.is_active == True,  # noqa: E712
+                )
+                .first()
+            )
+
+            slot_minutes = (
+                _safe_slot_minutes(provider_availability.slot_duration_minutes)
+                if provider_availability
+                else DEFAULT_SLOT_MINUTES
+            )
+
             return (
                 combine_date_time(date_value, provider_exception.start_time),
                 combine_date_time(date_value, provider_exception.end_time),
+                slot_minutes,
             )
 
         return None
@@ -140,10 +185,7 @@ def _resolve_provider_work_window(
     )
 
     if provider_availability:
-        return (
-            combine_date_time(date_value, provider_availability.start_time),
-            combine_date_time(date_value, provider_availability.end_time),
-        )
+        return _availability_to_window(date_value, provider_availability)
 
     return _default_work_window(date_value)
 
@@ -153,7 +195,7 @@ def resolve_work_window(
     provider_id: int,
     date_value: date,
     doctor_id: Optional[int],
-) -> Optional[tuple[datetime, datetime]]:
+) -> Optional[tuple[datetime, datetime, int]]:
     if doctor_id is not None:
         doctor_exception = (
             db.query(ProviderAvailabilityException)
@@ -164,18 +206,6 @@ def resolve_work_window(
             )
             .first()
         )
-
-        if doctor_exception:
-            if doctor_exception.is_closed:
-                return None
-
-            if doctor_exception.start_time and doctor_exception.end_time:
-                return (
-                    combine_date_time(date_value, doctor_exception.start_time),
-                    combine_date_time(date_value, doctor_exception.end_time),
-                )
-
-            return None
 
         doctor_availability = (
             db.query(ProviderAvailability)
@@ -188,11 +218,27 @@ def resolve_work_window(
             .first()
         )
 
+        if doctor_exception:
+            if doctor_exception.is_closed:
+                return None
+
+            if doctor_exception.start_time and doctor_exception.end_time:
+                slot_minutes = (
+                    _safe_slot_minutes(doctor_availability.slot_duration_minutes)
+                    if doctor_availability
+                    else DEFAULT_SLOT_MINUTES
+                )
+
+                return (
+                    combine_date_time(date_value, doctor_exception.start_time),
+                    combine_date_time(date_value, doctor_exception.end_time),
+                    slot_minutes,
+                )
+
+            return None
+
         if doctor_availability:
-            return (
-                combine_date_time(date_value, doctor_availability.start_time),
-                combine_date_time(date_value, doctor_availability.end_time),
-            )
+            return _availability_to_window(date_value, doctor_availability)
 
         return _resolve_provider_work_window(db, provider_id, date_value)
 
@@ -226,7 +272,7 @@ def _parse_google_dt(value: Any) -> Optional[datetime]:
     return None
 
 
-def _appointment_end(appt: Appointment) -> Optional[datetime]:
+def _appointment_end(appt: Appointment, fallback_minutes: int) -> Optional[datetime]:
     start_time = _as_naive(appt.start_time)
     end_time = _as_naive(appt.end_time)
 
@@ -236,7 +282,7 @@ def _appointment_end(appt: Appointment) -> Optional[datetime]:
     if end_time is not None:
         return end_time
 
-    return start_time + timedelta(minutes=SLOT_MINUTES)
+    return start_time + timedelta(minutes=_safe_slot_minutes(fallback_minutes))
 
 
 def _slot_overlaps(
@@ -253,8 +299,12 @@ def _has_contiguous_capacity(
     duration: int,
     end_dt: datetime,
     blocked_starts: set[datetime],
+    slot_minutes: int,
 ) -> bool:
-    slot_end = slot_start + timedelta(minutes=duration)
+    step = _safe_slot_minutes(slot_minutes)
+    requested_duration = max(int(duration), step)
+
+    slot_end = slot_start + timedelta(minutes=requested_duration)
     if slot_end > end_dt:
         return False
 
@@ -262,7 +312,7 @@ def _has_contiguous_capacity(
     while current < slot_end:
         if current in blocked_starts:
             return False
-        current += timedelta(minutes=SLOT_MINUTES)
+        current += timedelta(minutes=step)
 
     return True
 
@@ -315,6 +365,7 @@ def _add_google_busy_blocks(
     end_dt: datetime,
     base_slots: List[datetime],
     blocked_starts: set[datetime],
+    slot_minutes: int,
 ) -> None:
     mapping = _get_google_calendar_mapping(
         db,
@@ -334,6 +385,8 @@ def _add_google_busy_blocks(
     except Exception:
         return
 
+    step = _safe_slot_minutes(slot_minutes)
+
     for item in busy_items:
         busy_start = _parse_google_dt(item.get("start"))
         busy_end = _parse_google_dt(item.get("end"))
@@ -342,7 +395,7 @@ def _add_google_busy_blocks(
             continue
 
         for base_start in base_slots:
-            base_end = base_start + timedelta(minutes=SLOT_MINUTES)
+            base_end = base_start + timedelta(minutes=step)
             if _slot_overlaps(base_start, base_end, busy_start, busy_end):
                 blocked_starts.add(base_start)
 
@@ -351,7 +404,7 @@ def _add_google_busy_blocks(
 def get_free_slots(
     provider_id: int,
     date_str: date = Query(..., alias="date"),
-    duration: int = Query(30, ge=30),
+    duration: Optional[int] = Query(None, ge=5),
     doctor_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
@@ -379,8 +432,14 @@ def get_free_slots(
     if not window:
         return []
 
-    start_dt, end_dt = window
-    base_slots = generate_base_slots(start_dt, end_dt)
+    start_dt, end_dt, configured_slot_minutes = window
+    slot_minutes = _safe_slot_minutes(configured_slot_minutes)
+    requested_duration = int(duration) if duration else slot_minutes
+
+    if requested_duration < slot_minutes:
+        requested_duration = slot_minutes
+
+    base_slots = generate_base_slots(start_dt, end_dt, slot_minutes)
 
     if not base_slots:
         return []
@@ -405,13 +464,13 @@ def get_free_slots(
 
     for appt in appointments:
         appt_start = _as_naive(appt.start_time)
-        appt_end = _appointment_end(appt)
+        appt_end = _appointment_end(appt, slot_minutes)
 
         if appt_start is None or appt_end is None:
             continue
 
         for base_start in base_slots:
-            base_end = base_start + timedelta(minutes=SLOT_MINUTES)
+            base_end = base_start + timedelta(minutes=slot_minutes)
             if _slot_overlaps(base_start, base_end, appt_start, appt_end):
                 blocked_starts.add(base_start)
 
@@ -423,18 +482,20 @@ def get_free_slots(
         end_dt=end_dt,
         base_slots=base_slots,
         blocked_starts=blocked_starts,
+        slot_minutes=slot_minutes,
     )
 
     result = []
 
     for slot_start in base_slots:
-        slot_end = slot_start + timedelta(minutes=duration)
+        slot_end = slot_start + timedelta(minutes=requested_duration)
 
         available = _has_contiguous_capacity(
             slot_start=slot_start,
-            duration=duration,
+            duration=requested_duration,
             end_dt=end_dt,
             blocked_starts=blocked_starts,
+            slot_minutes=slot_minutes,
         )
 
         result.append(
@@ -442,6 +503,7 @@ def get_free_slots(
                 "start_time": slot_start.isoformat(),
                 "end_time": slot_end.isoformat(),
                 "available": available,
+                "slot_duration_minutes": slot_minutes,
             }
         )
 
