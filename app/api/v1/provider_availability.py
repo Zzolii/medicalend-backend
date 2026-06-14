@@ -23,6 +23,8 @@ from app.schemas.provider_availability import (
 
 router = APIRouter(prefix="/providers/me/availability", tags=["provider-availability"])
 
+ALLOWED_SLOT_DURATIONS = {5, 10, 15, 20, 30}
+
 
 def _get_my_active_membership(db: Session, current_user) -> Optional[ClinicMembership]:
     return (
@@ -37,11 +39,7 @@ def _get_my_active_membership(db: Session, current_user) -> Optional[ClinicMembe
 
 
 def _get_my_provider(db: Session, current_user) -> Provider:
-    provider = (
-        db.query(Provider)
-        .filter(Provider.user_id == current_user.id)
-        .first()
-    )
+    provider = db.query(Provider).filter(Provider.user_id == current_user.id).first()
     if provider:
         return provider
 
@@ -109,6 +107,22 @@ def _resolve_doctor_scope(
     return requested_doctor_id
 
 
+def _validate_time_window(start_time, end_time) -> None:
+    if start_time >= end_time:
+        raise HTTPException(
+            status_code=400,
+            detail="start_time must be earlier than end_time",
+        )
+
+
+def _validate_slot_duration(value: int) -> None:
+    if value not in ALLOWED_SLOT_DURATIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="slot_duration_minutes must be one of: 5, 10, 15, 20, 30",
+        )
+
+
 @router.get("", response_model=List[ProviderAvailabilityOut])
 def list_my_availability(
     doctor_id: Optional[int] = Query(None),
@@ -149,19 +163,25 @@ def create_or_update_my_availability(
         current_user=current_user,
     )
 
-    row = (
-        db.query(ProviderAvailability)
-        .filter(
-            ProviderAvailability.provider_id == provider.id,
-            ProviderAvailability.doctor_id == effective_doctor_id,
-            ProviderAvailability.weekday == payload.weekday,
-        )
-        .first()
+    _validate_time_window(payload.start_time, payload.end_time)
+    _validate_slot_duration(payload.slot_duration_minutes)
+
+    query = db.query(ProviderAvailability).filter(
+        ProviderAvailability.provider_id == provider.id,
+        ProviderAvailability.weekday == payload.weekday,
     )
+
+    if effective_doctor_id is None:
+        query = query.filter(ProviderAvailability.doctor_id.is_(None))
+    else:
+        query = query.filter(ProviderAvailability.doctor_id == effective_doctor_id)
+
+    row = query.first()
 
     if row:
         row.start_time = payload.start_time
         row.end_time = payload.end_time
+        row.slot_duration_minutes = payload.slot_duration_minutes
         row.is_active = True
         db.commit()
         db.refresh(row)
@@ -173,6 +193,7 @@ def create_or_update_my_availability(
         weekday=payload.weekday,
         start_time=payload.start_time,
         end_time=payload.end_time,
+        slot_duration_minutes=payload.slot_duration_minutes,
         is_active=True,
     )
 
@@ -263,21 +284,21 @@ def create_or_update_exception(
                 status_code=400,
                 detail="Open exception requires start_time and end_time",
             )
-        if payload.start_time >= payload.end_time:
-            raise HTTPException(
-                status_code=400,
-                detail="start_time must be earlier than end_time",
-            )
+        _validate_time_window(payload.start_time, payload.end_time)
 
-    row = (
-        db.query(ProviderAvailabilityException)
-        .filter(
-            ProviderAvailabilityException.provider_id == provider.id,
-            ProviderAvailabilityException.doctor_id == effective_doctor_id,
-            ProviderAvailabilityException.date == payload.date,
-        )
-        .first()
+    query = db.query(ProviderAvailabilityException).filter(
+        ProviderAvailabilityException.provider_id == provider.id,
+        ProviderAvailabilityException.date == payload.date,
     )
+
+    if effective_doctor_id is None:
+        query = query.filter(ProviderAvailabilityException.doctor_id.is_(None))
+    else:
+        query = query.filter(
+            ProviderAvailabilityException.doctor_id == effective_doctor_id
+        )
+
+    row = query.first()
 
     if row:
         row.is_closed = payload.is_closed
