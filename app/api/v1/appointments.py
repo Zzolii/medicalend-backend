@@ -32,7 +32,7 @@ router = APIRouter(prefix="/appointments", tags=["appointments"])
 
 REFERRAL_ACCESS_STATUSES = ("accepted", "in_progress", "completed")
 INACTIVE_EPISODE_STATUSES = ("completed", "closed", "archived")
-BLOCKING_APPOINTMENT_STATUSES = ("scheduled", "in_progress")
+BLOCKING_APPOINTMENT_STATUSES = ("scheduled", "confirmed", "pending", "in_progress")
 PROVIDER_VISIBLE_APPOINTMENT_STATUSES = ("scheduled", "in_progress", "completed")
 
 CLINIC_WIDE_VIEW_ROLES = {"clinic_admin", "reception", "receptionist"}

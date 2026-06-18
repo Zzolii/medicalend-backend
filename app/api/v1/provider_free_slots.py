@@ -28,7 +28,7 @@ DEFAULT_START_TIME = time(8, 0)
 DEFAULT_END_TIME = time(16, 0)
 
 STAFF_VIEW_ROLES = {"clinic_admin", "doctor", "assistant", "reception", "receptionist"}
-BLOCKING_STATUSES = {"scheduled", "in_progress"}
+BLOCKING_STATUSES = {"scheduled", "confirmed", "pending", "in_progress"}
 
 
 def _normalize_clinic_role(value: Optional[str]) -> Optional[str]:
@@ -448,8 +448,9 @@ def get_free_slots(
         db.query(Appointment)
         .filter(
             Appointment.provider_id == provider_id,
-            Appointment.start_time < end_dt,
             Appointment.status.in_(BLOCKING_STATUSES),
+            Appointment.start_time < end_dt,
+            Appointment.end_time > start_dt,
         )
     )
 
