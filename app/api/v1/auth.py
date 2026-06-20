@@ -634,6 +634,24 @@ def register_patient(payload: RegisterPatientRequest, db: Session = Depends(get_
 
     existing_user = _find_user_by_normalized_email(db, normalized_email)
     if existing_user:
+        rejected_provider = (
+            db.query(models.Provider)
+            .filter(
+                models.Provider.user_id == existing_user.id,
+                models.Provider.status == "rejected",
+            )
+            .first()
+        )
+
+        if rejected_provider:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Există deja o cerere respinsă pentru acest e-mail. "
+                    "Contactează administratorul MediCalend sau folosește o altă adresă de e-mail."
+                ),
+            )
+
         raise HTTPException(status_code=409, detail="Email already registered")
 
     user = models.User(
