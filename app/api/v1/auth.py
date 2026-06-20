@@ -138,6 +138,120 @@ def _save_provider_image(image_file: UploadFile | None) -> str | None:
     return _public_upload_url(safe_name)
 
 
+def _first_specialty_name(raw_specialty: str | None) -> str:
+    cleaned = _clean_optional_text(raw_specialty)
+
+    if cleaned:
+        first = cleaned.split(",")[0].strip()
+        if first:
+            return first
+
+    return "Medicină generală"
+
+
+def _build_owner_doctor_name(
+    *,
+    contact_person_name: str | None,
+    provider_name: str,
+    email: str,
+) -> str:
+    contact_name = _clean_optional_text(contact_person_name)
+    if contact_name:
+        return contact_name
+
+    clinic_name = _clean_optional_text(provider_name)
+    if clinic_name:
+        return clinic_name
+
+    local_part = email.split("@")[0].replace(".", " ").replace("_", " ").strip()
+    return local_part.title() if local_part else "Medic"
+
+
+def _create_default_owner_doctor_profile(
+    *,
+    db: Session,
+    provider,
+    membership,
+    owner_email: str,
+    contact_person_name: str | None,
+    contact_phone: str | None,
+    specialty: str | None,
+) -> None:
+    """
+    Clinic/Medic onboarding:
+    - păstrează user-ul ca provider / clinic_admin
+    - creează automat profilul de medic al administratorului
+    - leagă membership.provider_doctor_id de doctorul creat
+
+    Astfel un cabinet cu un singur medic poate fi folosit imediat fără ca
+    administratorul să se adauge manual ca medic.
+    """
+    provider_type = getattr(provider, "provider_type", None) or "clinic"
+    if provider_type == "home_care":
+        return
+
+    existing_owner_doctor = (
+        db.query(models.ProviderDoctor)
+        .filter(
+            models.ProviderDoctor.provider_id == provider.id,
+            func.lower(func.trim(models.ProviderDoctor.email)) == _normalize_email(owner_email),
+        )
+        .first()
+    )
+
+    if existing_owner_doctor:
+        membership.provider_doctor_id = existing_owner_doctor.id
+        membership.display_name = existing_owner_doctor.name
+        db.add(membership)
+        db.flush()
+        return
+
+    specialty_name = _first_specialty_name(specialty)
+
+    provider_specialty = (
+        db.query(models.ProviderSpecialty)
+        .filter(
+            models.ProviderSpecialty.provider_id == provider.id,
+            func.lower(func.trim(models.ProviderSpecialty.name))
+            == specialty_name.strip().lower(),
+        )
+        .first()
+    )
+
+    if not provider_specialty:
+        provider_specialty = models.ProviderSpecialty(
+            provider_id=provider.id,
+            name=specialty_name,
+            is_active=True,
+        )
+        db.add(provider_specialty)
+        db.flush()
+
+    doctor_name = _build_owner_doctor_name(
+        contact_person_name=contact_person_name,
+        provider_name=provider.name,
+        email=owner_email,
+    )
+
+    doctor = models.ProviderDoctor(
+        provider_id=provider.id,
+        specialty_id=provider_specialty.id,
+        name=doctor_name,
+        title="Dr.",
+        license_number=getattr(provider, "license_number", None),
+        phone=contact_phone or getattr(provider, "phone", None),
+        email=_normalize_email(owner_email),
+        is_active=True,
+    )
+    db.add(doctor)
+    db.flush()
+
+    membership.provider_doctor_id = doctor.id
+    membership.display_name = doctor_name
+    db.add(membership)
+    db.flush()
+
+
 def _send_verification_email(user: models.User) -> None:
     token = create_action_token(
         subject=str(user.id),
@@ -199,8 +313,6 @@ def _send_reset_password_email(user: models.User) -> None:
     """
     send_email(user.email, subject, text_body, html_body)
 
-
-# Path: backend/app/api/v1/auth.py
 
 def _ensure_provider_login_allowed(db: Session, user: models.User) -> None:
     provider = (
@@ -322,6 +434,7 @@ def _create_provider_record(
     normalized_email = _normalize_email(email)
     normalized_contact_email = _normalize_email(contact_email)
     normalized_country = (country or "RO").strip().upper()
+    normalized_provider_type = (provider_type or "clinic").strip() or "clinic"
 
     existing_user = _find_user_by_normalized_email(db, normalized_email)
     if existing_user:
@@ -397,7 +510,7 @@ def _create_provider_record(
         user_id=user.id,
         clinic_id=clinic.id,
         name=name,
-        provider_type=provider_type,
+        provider_type=normalized_provider_type,
         website=website,
         image_url=image_url,
         public_description=public_description,
@@ -425,6 +538,17 @@ def _create_provider_record(
         rejection_reason=None,
     )
     db.add(provider)
+    db.flush()
+
+    _create_default_owner_doctor_profile(
+        db=db,
+        provider=provider,
+        membership=membership,
+        owner_email=normalized_email,
+        contact_person_name=contact_person_name,
+        contact_phone=contact_phone or phone,
+        specialty=specialty,
+    )
 
     db.commit()
     db.refresh(provider)
