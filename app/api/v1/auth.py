@@ -643,16 +643,44 @@ def register_patient(payload: RegisterPatientRequest, db: Session = Depends(get_
             .first()
         )
 
-        if rejected_provider:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Există deja o cerere respinsă pentru acest e-mail. "
-                    "Contactează administratorul MediCalend sau folosește o altă adresă de e-mail."
-                ),
-            )
+        if not rejected_provider:
+            raise HTTPException(status_code=409, detail="Email already registered")
 
-        raise HTTPException(status_code=409, detail="Email already registered")
+        rejected_clinic_id = getattr(rejected_provider, "clinic_id", None)
+
+        db.query(models.ProviderAvailabilityException).filter(
+            models.ProviderAvailabilityException.provider_id == rejected_provider.id
+        ).delete(synchronize_session=False)
+
+        db.query(models.ProviderAvailability).filter(
+            models.ProviderAvailability.provider_id == rejected_provider.id
+        ).delete(synchronize_session=False)
+
+        db.query(models.ProviderDoctor).filter(
+            models.ProviderDoctor.provider_id == rejected_provider.id
+        ).delete(synchronize_session=False)
+
+        db.query(models.ProviderSpecialty).filter(
+            models.ProviderSpecialty.provider_id == rejected_provider.id
+        ).delete(synchronize_session=False)
+
+        db.delete(rejected_provider)
+
+        if rejected_clinic_id is not None:
+            db.query(models.ClinicMembership).filter(
+                models.ClinicMembership.clinic_id == rejected_clinic_id
+            ).delete(synchronize_session=False)
+
+            rejected_clinic = (
+                db.query(models.Clinic)
+                .filter(models.Clinic.id == rejected_clinic_id)
+                .first()
+            )
+            if rejected_clinic:
+                db.delete(rejected_clinic)
+
+        db.delete(existing_user)
+        db.flush()
 
     user = models.User(
         email=normalized_email,
