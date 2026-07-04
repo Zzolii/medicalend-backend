@@ -1335,14 +1335,18 @@ def delete_appointment(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    if current_user.role in ("admin", "patient"):
-        raise HTTPException(status_code=403, detail="Not enough permissions")
+    if current_user.role == "admin":
+        _raise_platform_admin_appointment_access_denied()
 
-    appointment = db.query(AppointmentModel).filter(AppointmentModel.id == appointment_id).first()
-    if not appointment:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
+    appointment = _get_appointment_or_404(db, appointment_id)
 
     _ensure_appointment_access(db, appointment, current_user)
+
+    if appointment.status != "canceled":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Doar programările anulate pot fi șterse.",
+        )
 
     db.delete(appointment)
     db.commit()
