@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class CareEpisodeBase(BaseModel):
@@ -15,8 +15,10 @@ class CareEpisodeBase(BaseModel):
     @classmethod
     def validate_title(cls, value: str) -> str:
         cleaned = value.strip()
+
         if not cleaned:
             raise ValueError("Titlul episodului este obligatoriu.")
+
         return cleaned
 
 
@@ -28,8 +30,10 @@ class CareEpisodeCreate(BaseModel):
     @classmethod
     def validate_title(cls, value: str) -> str:
         cleaned = value.strip()
+
         if not cleaned:
             raise ValueError("Titlul episodului este obligatoriu.")
+
         return cleaned
 
 
@@ -42,18 +46,22 @@ class CareEpisodeUpdate(BaseModel):
     @classmethod
     def validate_optional_title(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
-            return value
+            return None
 
         cleaned = value.strip()
+
         if not cleaned:
             raise ValueError("Titlul episodului nu poate fi gol.")
+
         return cleaned
 
 
 class CareEpisodeOut(CareEpisodeBase):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     owner_provider_id: int
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    patient_name: Optional[str] = None
+    owner_provider_name: Optional[str] = None
